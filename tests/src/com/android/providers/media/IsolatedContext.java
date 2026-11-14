@@ -68,6 +68,7 @@ public class IsolatedContext extends ContextWrapper {
     private Map<String, ApplicationInfo> mPackageNameToAppInfoMap = new HashMap<>();
     private boolean mByPassTargetSdkCheckForTrash;
     private boolean mByPassManageExternalStorageCheckForTrash;
+    private volatile boolean mAsFuseThread;
     private PhotoPickerProvider mPhotoPickerProvider;
 
     public IsolatedContext(Context base, String tag, boolean asFuseThread) {
@@ -93,6 +94,7 @@ public class IsolatedContext extends ContextWrapper {
     public IsolatedContext(Context base, String tag, boolean asFuseThread,
             UserHandle userHandle, ConfigStore configStore, LauncherApps launcherApps) {
         super(base);
+        mAsFuseThread = asFuseThread;
         mDir = new File(base.getFilesDir(), tag);
         mDir.mkdirs();
         FileUtils.deleteContents(mDir);
@@ -139,7 +141,7 @@ public class IsolatedContext extends ContextWrapper {
         return new MediaProvider() {
             @Override
             public boolean isFuseThread() {
-                return asFuseThread;
+                return mAsFuseThread;
             }
 
             @Override
@@ -188,6 +190,13 @@ public class IsolatedContext extends ContextWrapper {
 
             }
         };
+    }
+
+    /**
+     * Lets a test act as the FUSE daemon for some calls and as an app for others.
+     */
+    public void setAsFuseThread(boolean asFuseThread) {
+        mAsFuseThread = asFuseThread;
     }
 
     public void setByPassTargetSdkCheckForTrash(boolean shouldByPass) {

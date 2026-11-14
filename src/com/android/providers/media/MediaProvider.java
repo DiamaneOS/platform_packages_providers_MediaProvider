@@ -6171,6 +6171,96 @@ public class MediaProvider extends ContentProvider {
         return qb;
     }
 
+    /**
+     * Handles an insert into a media collection from a caller that is not allowed to set
+     * {@link MediaColumns#DATA}, when that path is a file the calling package already owns.
+     * <p>
+     * Apps sometimes create a file via direct path, which gives them a pending database entry,
+     * and then insert the same path via ContentResolver. Instead of failing that insert, the file
+     * is scanned, which publishes the existing entry, and that entry is returned.
+     * <p>
+     * No entry is created, the owner is not changed and none of the caller's values are stored.
+     * The scan is the one that any caller can request through {@link MediaStore#scanFile}.
+     *
+     * @return {@link Uri} of the caller's existing entry in the collection of {@code uri}, or
+     *         {@code null} if the insert must be refused.
+     */
+    @Nullable
+    private Uri scanOwnedFileForInsert(int match, @NonNull Uri uri,
+            @NonNull DatabaseHelper helper, @NonNull ContentValues values) {
+        final int mediaType;
+        final int scannedMatch;
+        switch (match) {
+            case IMAGES_MEDIA:
+                mediaType = FileColumns.MEDIA_TYPE_IMAGE;
+                scannedMatch = IMAGES_MEDIA_ID;
+                break;
+            case VIDEO_MEDIA:
+                mediaType = FileColumns.MEDIA_TYPE_VIDEO;
+                scannedMatch = VIDEO_MEDIA_ID;
+                break;
+            case AUDIO_MEDIA:
+                mediaType = FileColumns.MEDIA_TYPE_AUDIO;
+                scannedMatch = AUDIO_MEDIA_ID;
+                break;
+            default:
+                return null;
+        }
+
+        // A caller that asks for a pending item does not want the file published
+        if (DatabaseUtils.getAsBoolean(values, MediaColumns.IS_PENDING, false)) {
+            return null;
+        }
+
+        final String data = values.getAsString(MediaColumns.DATA);
+        if (TextUtils.isEmpty(data)) {
+            return null;
+        }
+        final File file;
+        try {
+            file = FileUtils.getCanonicalFile(data);
+        } catch (IOException e) {
+            return null;
+        }
+        final String path = file.getAbsolutePath();
+
+        // The file must be on shared storage, on the volume that the caller inserts into
+        final String volumeName = extractVolumeName(path);
+        final String requestedVolumeName = getVolumeName(uri);
+        if (helper.isInternal() || MediaStore.VOLUME_INTERNAL.equals(volumeName)
+                || !(MediaStore.VOLUME_EXTERNAL.equals(requestedVolumeName)
+                        || requestedVolumeName.equals(volumeName))) {
+            return null;
+        }
+        if (!file.isFile() || getFileMediaType(path) != mediaType) {
+            return null;
+        }
+
+        // Same ownership rule as the upsert in insertAllowingUpsert()
+        final long rowId = getIdIfPathOwnedByPackages(getQueryBuilderForUpsert(path), helper, path,
+                getAllowedPackagesForUpsert(null /* givenOwnerPackage */));
+        if (rowId == -1) {
+            return null;
+        }
+
+        final Uri scannedUri;
+        final LocalCallingIdentity token = clearLocalCallingIdentity();
+        final CallingIdentity providerToken = clearCallingIdentity();
+        try {
+            scannedUri = scanFile(file, REASON_DEMAND);
+        } finally {
+            restoreCallingIdentity(providerToken);
+            restoreLocalCallingIdentity(token);
+        }
+
+        // The scan decides what the file is. Hidden files, for example, are not media items.
+        if (scannedUri == null || matchUri(scannedUri, true /* allowHidden */) != scannedMatch
+                || ContentUris.parseId(scannedUri) != rowId) {
+            return null;
+        }
+        return ContentUris.withAppendedId(uri, rowId);
+    }
+
     private void maybePut(@NonNull ContentValues values, @NonNull String key,
             @Nullable String value) {
         if (value != null) {
@@ -6329,6 +6419,14 @@ public class MediaProvider extends ContentProvider {
                     // allowed to insert files anywhere.
                 } else if (getCallingPackageTargetSdkVersion() >=
                         Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                    // An app that wrote a file via direct path and now inserts that same path
+                    // is publishing its own file. Scan the file and return the row that the
+                    // app already owns instead of failing the insert.
+                    final Uri ownedUri = MediaColumns.DATA.equals(column)
+                            ? scanOwnedFileForInsert(match, uri, helper, initialValues) : null;
+                    if (ownedUri != null) {
+                        return ownedUri;
+                    }
                     // Throwing an exception so that it doesn't result in some unexpected
                     // behavior for apps and make them aware of what is happening.
                     throw new IllegalArgumentException("Mutation of " + column
