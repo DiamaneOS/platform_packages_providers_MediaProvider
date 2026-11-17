@@ -52,8 +52,6 @@ import android.content.res.Resources;
 import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.graphics.ImageDecoder;
-import android.graphics.ImageDecoder.ImageInfo;
-import android.graphics.ImageDecoder.Source;
 import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Icon;
 import android.net.Uri;
@@ -67,7 +65,6 @@ import android.provider.MediaStore.MediaColumns;
 import android.text.TextUtils;
 import android.util.DisplayMetrics;
 import android.util.Log;
-import android.util.Size;
 import android.view.KeyEvent;
 import android.view.View;
 import android.view.ViewGroup;
@@ -84,6 +81,7 @@ import androidx.annotation.VisibleForTesting;
 import androidx.appcompat.widget.AppCompatTextView;
 
 import com.android.modules.utils.build.SdkLevel;
+import com.android.providers.media.vmdecode.VmDecode;
 import com.android.providers.media.util.Metrics;
 import com.android.providers.media.util.StringUtils;
 
@@ -1046,18 +1044,21 @@ public class PermissionActivity extends Activity {
                         }
                     }
                 }
+                // Both images are decoded in the decode service's VM, never in this process. When the
+                // service is unavailable the IOException below shows the type icon instead.
+                VmDecode.init(context);
                 if ((loadFlags & LOAD_THUMBNAIL) != 0) {
-                    final Size size = new Size(res.getDisplayMetrics().widthPixels,
-                            res.getDisplayMetrics().widthPixels);
-                    thumbnail = resolver.loadThumbnail(uri, size, null);
+                    final int side = res.getDisplayMetrics().widthPixels;
+                    thumbnail = VmDecode.decodeForDisplay(resolver, uri, side, side);
                 }
                 if ((loadFlags & LOAD_FULL) != 0) {
                     // Only offer full decodes when a supported file type;
                     // otherwise fall back to using thumbnail
                     final String mimeType = resolver.getType(uri);
                     if (ImageDecoder.isMimeTypeSupported(mimeType)) {
-                        full = ImageDecoder.decodeBitmap(ImageDecoder.createSource(resolver, uri),
-                                new Resizer(context.getResources().getDisplayMetrics()));
+                        final DisplayMetrics metrics = context.getResources().getDisplayMetrics();
+                        final int maxSize = Math.max(metrics.widthPixels, metrics.heightPixels);
+                        full = VmDecode.decodeForDisplay(resolver, uri, maxSize, maxSize);
                     } else {
                         full = thumbnail;
                     }
@@ -1098,30 +1099,6 @@ public class PermissionActivity extends Activity {
             imageView.setContentDescription(contentDescription);
             imageView.setVisibility(View.VISIBLE);
             imageView.setClipToOutline(true);
-        }
-    }
-
-    /**
-     * Utility that will speed up decoding of large images, since we never need
-     * them to be larger than the screen dimensions.
-     */
-    private static class Resizer implements ImageDecoder.OnHeaderDecodedListener {
-        private final int maxSize;
-
-        public Resizer(DisplayMetrics metrics) {
-            this.maxSize = Math.max(metrics.widthPixels, metrics.heightPixels);
-        }
-
-        @Override
-        public void onHeaderDecoded(ImageDecoder decoder, ImageInfo info, Source source) {
-            // We requested a rough thumbnail size, but the remote size may have
-            // returned something giant, so defensively scale down as needed.
-            final int widthSample = info.getSize().getWidth() / maxSize;
-            final int heightSample = info.getSize().getHeight() / maxSize;
-            final int sample = Math.max(widthSample, heightSample);
-            if (sample > 1) {
-                decoder.setTargetSampleSize(sample);
-            }
         }
     }
 }

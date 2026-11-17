@@ -89,6 +89,10 @@ android_app {
     sdk_version: "module_current",
     min_sdk_version: "30",
 
+    aidl: {
+        local_include_dirs: ["vmdecode-aidl"],
+    },
+
     certificate: "media",
     privileged: true,
     privapp_allowlist: ":privapp_allowlist_com.android.providers.media.module.xml",
@@ -124,7 +128,16 @@ filegroup {
         "src/**/*.aidl",
         "src/**/*.java",
         ":statslog-mediaprovider-java-gen",
+        ":mediaprovider-vmdecode-aidl",
     ],
+}
+
+// The decode service's API (de.diamaneos.sanitizer, IDecodeService). A copy of the files in
+// DiamaneOS/platform_packages_apps_Sanitizer: both sides change together.
+filegroup {
+    name: "mediaprovider-vmdecode-aidl",
+    srcs: ["vmdecode-aidl/**/*.aidl"],
+    path: "vmdecode-aidl",
 }
 
 // This is defined to give LegacyMediaProvider the bare minimum it needs

@@ -16,11 +16,12 @@
 
 package com.android.providers.media.util;
 
-import android.graphics.BitmapFactory;
 import android.media.ExifInterface;
 import android.os.Trace;
 import android.provider.MediaStore.Files.FileColumns;
 import android.util.Log;
+
+import com.android.providers.media.vmdecode.VmDecode;
 
 import org.xmlpull.v1.XmlPullParser;
 import org.xmlpull.v1.XmlPullParserException;
@@ -100,18 +101,20 @@ public class SpecialFormatDetector {
      *         file. Otherwise returns {@link FileColumns#_SPECIAL_FORMAT_NONE}
      */
     private static int detectGifOrAnimatedWebp(File file) throws IOException {
-        final BitmapFactory.Options bitmapOptions = new BitmapFactory.Options();
-        // Set options such that the image is not decoded to a bitmap, as we only want mimetype
-        // options
-        bitmapOptions.inSampleSize = 1;
-        bitmapOptions.inJustDecodeBounds = true;
-        BitmapFactory.decodeFile(file.getAbsolutePath(), bitmapOptions);
+        // The header is read in the decode service's VM, not here. Unavailable throws
+        // VmDecodeUnavailableException, and the caller leaves the value unset to try again later.
+        final VmDecode.Info info;
+        try {
+            info = VmDecode.probe(file, null, VmDecode.PRIORITY_BACKGROUND);
+        } catch (com.android.providers.media.vmdecode.VmDecodeRejectedException e) {
+            // Not an image the VM can read: no special format, as before for undecodable files.
+            return FileColumns._SPECIAL_FORMAT_NONE;
+        }
 
-        if ("image/gif".equalsIgnoreCase(bitmapOptions.outMimeType)) {
+        if (info.isGif()) {
             return FileColumns._SPECIAL_FORMAT_GIF;
         }
-        if ("image/webp".equalsIgnoreCase(bitmapOptions.outMimeType)
-                && WebpDetectorUtils.isAnimatedWebp(file)) {
+        if (info.isWebp() && info.animated) {
             return FileColumns._SPECIAL_FORMAT_ANIMATED_WEBP;
         }
 

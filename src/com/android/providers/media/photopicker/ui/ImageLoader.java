@@ -37,7 +37,6 @@ import com.bumptech.glide.Glide;
 import com.bumptech.glide.RequestBuilder;
 import com.bumptech.glide.load.Option;
 import com.bumptech.glide.load.PreferredColorSpace;
-import com.bumptech.glide.load.resource.gif.GifDrawable;
 import com.bumptech.glide.request.RequestOptions;
 import com.bumptech.glide.signature.ObjectKey;
 
@@ -118,25 +117,8 @@ public class ImageLoader {
      */
     public void loadImagePreview(@NonNull Item item, @NonNull ImageView imageView)  {
         final GlideLoadable loadable = item.toGlideLoadable();
-        if (item.isGif()) {
-            loadWithGlide(
-                    getGifRequestBuilder(loadable),
-                    /* requestOptions */ null,
-                    getGlideSignature(loadable, /* prefix= */ PREVIEW_PREFIX),
-                    imageView);
-            return;
-        }
-
-        if (item.isAnimatedWebp()) {
-            loadWithGlide(
-                    getDrawableRequestBuilder(loadable),
-                    /* requestOptions */ null,
-                    getGlideSignature(loadable, PREVIEW_PREFIX),
-                    imageView);
-            return;
-        }
-
-        // Preview as bitmap image for all other image types
+        // Every preview, GIF and animated WebP included, is a still image: the picker's fetcher hands Glide
+        // a PNG made from pixels decoded in the decode service's VM, never the original bytes.
         loadWithGlide(
                 getBitmapRequestBuilder(loadable),
                 /* requestOptions */ null,
@@ -164,12 +146,6 @@ public class ImageLoader {
     private RequestBuilder<Bitmap> getBitmapRequestBuilder(GlideLoadable loadable) {
         return Glide.with(mContext)
                 .asBitmap()
-                .load(loadable);
-    }
-
-    private RequestBuilder<GifDrawable> getGifRequestBuilder(GlideLoadable loadable) {
-        return Glide.with(mContext)
-                .asGif()
                 .load(loadable);
     }
 

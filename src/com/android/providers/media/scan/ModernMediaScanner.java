@@ -79,7 +79,6 @@ import android.database.sqlite.SQLiteBlobTooBigException;
 import android.database.sqlite.SQLiteDatabase;
 import android.drm.DrmManagerClient;
 import android.drm.DrmSupportInfo;
-import android.graphics.BitmapFactory;
 import android.media.ExifInterface;
 import android.media.MediaMetadataRetriever;
 import android.mtp.MtpConstants;
@@ -133,6 +132,8 @@ import com.android.providers.media.util.Metrics;
 import com.android.providers.media.util.MimeUtils;
 import com.android.providers.media.util.SpecialFormatDetector;
 import com.android.providers.media.util.XmpDataParser;
+import com.android.providers.media.vmdecode.VmDecode;
+import com.android.providers.media.vmdecode.VmDecodeUnavailableException;
 import com.android.providers.media.util.XmpInterface;
 
 import org.json.JSONObject;
@@ -1566,15 +1567,20 @@ public class ModernMediaScanner implements MediaScanner {
     private void withBitmapResolutionValues(
             @NonNull ContentProviderOperation.Builder op,
             @NonNull File file) {
-        final BitmapFactory.Options bitmapOptions = new BitmapFactory.Options();
-        bitmapOptions.inSampleSize = 1;
-        bitmapOptions.inJustDecodeBounds = true;
-        bitmapOptions.outWidth = 0;
-        bitmapOptions.outHeight = 0;
-        BitmapFactory.decodeFile(file.getAbsolutePath(), bitmapOptions);
+        // The header is read in the decode service's VM. When it is unavailable the size stays unset, and idle
+        // maintenance fills it in together with the special format.
+        int outWidth = 0;
+        int outHeight = 0;
+        try {
+            final VmDecode.Info info = VmDecode.probe(file, null, VmDecode.PRIORITY_BACKGROUND);
+            outWidth = info.width;
+            outHeight = info.height;
+        } catch (IOException e) {
+            Log.w(TAG, "No image size for " + file + ": " + e.getMessage());
+        }
 
-        final Optional<?> width = parseOptionalOrZero(bitmapOptions.outWidth);
-        final Optional<?> height = parseOptionalOrZero(bitmapOptions.outHeight);
+        final Optional<?> width = parseOptionalOrZero(outWidth);
+        final Optional<?> height = parseOptionalOrZero(outHeight);
         withOptionalValue(op, MediaColumns.WIDTH, width);
         withOptionalValue(op, MediaColumns.HEIGHT, height);
         withOptionalValue(op, MediaColumns.RESOLUTION, parseOptionalResolution(width, height));
@@ -1797,7 +1803,12 @@ public class ModernMediaScanner implements MediaScanner {
             final XmpInterface xmp = XmpDataParser.createXmpInterface(exif);
             withXmpValues(op, xmp, mimeType);
 
-            op.withValue(FileColumns._SPECIAL_FORMAT, SpecialFormatDetector.detect(exif, file));
+            try {
+                op.withValue(FileColumns._SPECIAL_FORMAT, SpecialFormatDetector.detect(exif, file));
+            } catch (VmDecodeUnavailableException e) {
+                // NULL makes idle maintenance try again once the decode service is back.
+                op.withValue(FileColumns._SPECIAL_FORMAT, null);
+            }
         } catch (Exception e) {
             logTroubleScanning(file, e);
         }

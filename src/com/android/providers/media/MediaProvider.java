@@ -244,7 +244,6 @@ import android.database.MatrixCursor;
 import android.database.sqlite.SQLiteConstraintException;
 import android.database.sqlite.SQLiteDatabase;
 import android.graphics.Bitmap;
-import android.graphics.BitmapFactory;
 import android.graphics.drawable.Icon;
 import android.icu.util.ULocale;
 import android.media.ThumbnailUtils;
@@ -344,6 +343,8 @@ import com.android.providers.media.scan.MediaScanner;
 import com.android.providers.media.scan.MediaScanner.ScanReason;
 import com.android.providers.media.scan.ModernMediaScanner;
 import com.android.providers.media.stableuris.dao.BackupIdRow;
+import com.android.providers.media.vmdecode.VmDecode;
+import com.android.providers.media.vmdecode.VmDecodeUnavailableException;
 import com.android.providers.media.util.CachedSupplier;
 import com.android.providers.media.util.DatabaseUtils;
 import com.android.providers.media.util.ExpiredItemsUtils;
@@ -1688,6 +1689,9 @@ public class MediaProvider extends ContentProvider {
         final int thumbSize = Math.min(metrics.widthPixels, metrics.heightPixels) / 2;
         mThumbSize = new Size(thumbSize, thumbSize);
 
+        // Images are decoded only in the protected VM of the decode service, never in this process.
+        VmDecode.init(context);
+
         mConfigStore = createConfigStore();
         mDatabaseBackupAndRecovery = createDatabaseBackupAndRecovery();
 
@@ -2272,11 +2276,20 @@ public class MediaProvider extends ContentProvider {
         // Accumulate all the new SPECIAL_FORMAT updates with their ids
         ArrayMap<Long, Integer> newSpecialFormatValues = new ArrayMap<>();
         final String limit = String.valueOf(IDLE_MAINTENANCE_ROWS_LIMIT);
+        ArrayMap<Long, String> pathsWithoutSize = new ArrayMap<>();
         try (Cursor c = queryForPendingSpecialFormatColumns(externalDb, limit, signal)) {
             while (c.moveToNext() && !signal.isCanceled()) {
                 final long id = c.getLong(0);
                 final String path = c.getString(1);
-                newSpecialFormatValues.put(id, getSpecialFormatValue(path));
+                final Integer specialFormat = getSpecialFormatValue(path);
+                if (specialFormat == null) {
+                    // The decode service is unavailable: stays NULL, tried again next time.
+                    continue;
+                }
+                newSpecialFormatValues.put(id, specialFormat);
+                if (c.isNull(2)) {
+                    pathsWithoutSize.put(id, path);
+                }
             }
         }
 
@@ -2297,6 +2310,19 @@ public class MediaProvider extends ContentProvider {
 
             externalDbValues.clear();
             externalDbValues.put(_SPECIAL_FORMAT, specialFormat);
+            final String pathWithoutSize = pathsWithoutSize.get(id);
+            if (pathWithoutSize != null) {
+                try {
+                    final VmDecode.Info info = VmDecode.probe(new File(pathWithoutSize), null,
+                            VmDecode.PRIORITY_BACKGROUND);
+                    externalDbValues.put(MediaColumns.WIDTH, info.width);
+                    externalDbValues.put(MediaColumns.HEIGHT, info.height);
+                    externalDbValues.put(MediaColumns.RESOLUTION,
+                            info.width + "\u00d7" + info.height);
+                } catch (IOException e) {
+                    Log.w(TAG, "No image size for " + pathWithoutSize + ": " + e.getMessage());
+                }
+            }
             final String externalDbSelection = MediaColumns._ID + "=?";
             final String[] externalDbSelectionArgs = new String[]{String.valueOf(id)};
             boolean externalDbWriteSuccess =
@@ -2311,7 +2337,8 @@ public class MediaProvider extends ContentProvider {
         Log.d(TAG, "Updated standard_mime_type_extension for " + count + " items");
     }
 
-    private int getSpecialFormatValue(String path) {
+    /** The special format of an image, or null when the decode service is unavailable (try again later). */
+    private Integer getSpecialFormatValue(String path) {
         final File file = new File(path);
         if (!file.exists()) {
             // We always update special format to none if the file is not found or there is an
@@ -2321,6 +2348,9 @@ public class MediaProvider extends ContentProvider {
 
         try {
             return SpecialFormatDetector.detect(file);
+        } catch (VmDecodeUnavailableException e) {
+            Log.d(TAG, "Special format later, decode service unavailable: " + e.getMessage());
+            return null;
         } catch (Exception e) {
             // we tried our best, no need to run special detection again and again if it
             // throws exception once, it is likely to do so everytime.
@@ -2334,7 +2364,8 @@ public class MediaProvider extends ContentProvider {
         // Run special detection for images only
         final String selection = _SPECIAL_FORMAT + " IS NULL AND "
                 + MEDIA_TYPE + "=" + MEDIA_TYPE_IMAGE;
-        final String[] projection = new String[] { MediaColumns._ID, MediaColumns.DATA };
+        final String[] projection = new String[] { MediaColumns._ID, MediaColumns.DATA,
+                MediaColumns.WIDTH };
         return db.query(/* distinct */ true, "files", projection, selection, null, null, null,
                 null, limit, signal);
     }
@@ -9938,8 +9969,8 @@ public class MediaProvider extends ContentProvider {
     private final Thumbnailer mAudioThumbnailer = new Thumbnailer(Environment.DIRECTORY_MUSIC) {
         @Override
         public Bitmap getThumbnailBitmap(Uri uri, CancellationSignal signal) throws IOException {
-            return ThumbnailUtils.createAudioThumbnail(queryForDataFile(uri, signal),
-                    mThumbSize, signal);
+            return VmDecode.audioThumbnail(queryForDataFile(uri, signal), mThumbSize,
+                    queryForOwnerPackage(uri, signal), signal);
         }
     };
 
@@ -9954,8 +9985,8 @@ public class MediaProvider extends ContentProvider {
     private final Thumbnailer mImageThumbnailer = new Thumbnailer(Environment.DIRECTORY_PICTURES) {
         @Override
         public Bitmap getThumbnailBitmap(Uri uri, CancellationSignal signal) throws IOException {
-            return ThumbnailUtils.createImageThumbnail(queryForDataFile(uri, signal),
-                    mThumbSize, signal);
+            return VmDecode.imageThumbnail(queryForDataFile(uri, signal), mThumbSize,
+                    queryForOwnerPackage(uri, signal), signal);
         }
     };
 
@@ -11435,12 +11466,15 @@ public class MediaProvider extends ContentProvider {
      * by reading data from the underlying image.
      */
     private void updateImageMetadata(ContentValues values, File file) {
-        final BitmapFactory.Options bitmapOpts = new BitmapFactory.Options();
-        bitmapOpts.inJustDecodeBounds = true;
-        BitmapFactory.decodeFile(file.getAbsolutePath(), bitmapOpts);
-
-        values.put(MediaColumns.WIDTH, bitmapOpts.outWidth);
-        values.put(MediaColumns.HEIGHT, bitmapOpts.outHeight);
+        // The header is read in the decode service's VM. Without it the size stays unknown here and the scanner or
+        // idle maintenance fills it in later.
+        try {
+            final VmDecode.Info info = VmDecode.probe(file, null, VmDecode.PRIORITY_BACKGROUND);
+            values.put(MediaColumns.WIDTH, info.width);
+            values.put(MediaColumns.HEIGHT, info.height);
+        } catch (IOException e) {
+            Log.w(TAG, "No image size for " + file + ": " + e.getMessage());
+        }
     }
 
     private void handleInsertedRowForFuse(long rowId) {
@@ -11510,6 +11544,20 @@ public class MediaProvider extends ContentProvider {
             } else {
                 return new File(data);
             }
+        }
+    }
+
+    /**
+     * Return the {@link MediaColumns#OWNER_PACKAGE_NAME} of the given {@code Uri}, or null. The decode service queues
+     * work per owner, so one app's files cannot hold up everyone else's.
+     */
+    @Nullable
+    String queryForOwnerPackage(Uri uri, CancellationSignal signal) {
+        try (Cursor cursor = queryForSingleItem(uri, new String[] { MediaColumns.OWNER_PACKAGE_NAME },
+                null, null, signal)) {
+            return cursor.getString(0);
+        } catch (FileNotFoundException | RuntimeException e) {
+            return null;
         }
     }
 
