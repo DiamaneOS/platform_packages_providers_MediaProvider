@@ -292,7 +292,7 @@ public final class VmDecode {
         if (SourceReader.onFuse(pfd)) {
             // Even a stat can stall on FUSE: everything happens on a reader thread with a deadline, and the
             // service gets a memory file.
-            final byte[] bytes = SourceReader.read(pfd, offset, length, IDecodeService.MAX_INPUT_BYTES, false,
+            final byte[] bytes = SourceReader.read(pfd, offset, length, IDecodeService.MAX_BUFFERED_BYTES, false,
                     owner, COPY_DEADLINE_MILLIS);
             try (ParcelFileDescriptor memory = memoryFile(bytes, bytes.length)) {
                 return decode(memory, owner, priority, null, maxWidth, maxHeight, signal);
@@ -311,7 +311,7 @@ public final class VmDecode {
             }
             return decode(pfd, owner, priority, null, maxWidth, maxHeight, signal);
         }
-        if (length < 0 || length > IDecodeService.MAX_INPUT_BYTES || offset < 0) {
+        if (length < 0 || length > IDecodeService.MAX_BUFFERED_BYTES || offset < 0) {
             throw new VmDecodeRejectedException("asset part out of range");
         }
         try (ParcelFileDescriptor part = copyToMemory(pfd.getFileDescriptor(), offset, (int) length)) {
@@ -380,7 +380,7 @@ public final class VmDecode {
     /** Bytes already in memory, such as an embedded picture, as a memory file: no thread, nothing to block on. */
     private static Bitmap decodeBytes(byte[] bytes, @Nullable String owner, Size size,
             @Nullable CancellationSignal signal) throws IOException {
-        if (bytes.length > IDecodeService.MAX_INPUT_BYTES) {
+        if (bytes.length > IDecodeService.MAX_BUFFERED_BYTES) {
             throw new VmDecodeRejectedException("picture too large: " + bytes.length);
         }
         try (ParcelFileDescriptor memory = memoryFile(bytes, bytes.length)) {
@@ -422,7 +422,7 @@ public final class VmDecode {
             return pfd.dup();
         }
         final byte[] bytes = SourceReader.read(pfd, 0, -1,
-                probe ? IDecodeService.MAX_PROBE_BYTES : IDecodeService.MAX_INPUT_BYTES, probe, owner,
+                probe ? IDecodeService.MAX_PROBE_BYTES : IDecodeService.MAX_BUFFERED_BYTES, probe, owner,
                 COPY_DEADLINE_MILLIS);
         return memoryFile(bytes, bytes.length);
     }
