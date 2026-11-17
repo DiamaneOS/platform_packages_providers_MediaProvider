@@ -117,7 +117,15 @@ public final class DecodeChecks {
         for (String id : new String[] {m.documentId, m.instanceId, m.originalDocumentId}) {
             if (!id(id)) return "identifier";
         }
-        if (m.specialFormat < 0 || m.specialFormat > 3) return "special format";
+        // GIF is always a GIF, an animated WebP is one, a motion photo is marked in its XMP (JPEG, PNG, WebP, HEIF,
+        // AVIF): the same rule as the service's own check (GuestLink).
+        boolean special = m.specialFormat == 0
+                || (m.specialFormat == 1 && m.format == IDecodeService.FORMAT_GIF)
+                || (m.specialFormat == 2 && (m.format == IDecodeService.FORMAT_JPEG
+                        || m.format == IDecodeService.FORMAT_PNG || m.format == IDecodeService.FORMAT_WEBP
+                        || m.format == IDecodeService.FORMAT_HEIF || m.format == IDecodeService.FORMAT_AVIF))
+                || (m.specialFormat == 3 && m.format == IDecodeService.FORMAT_WEBP);
+        if (!special) return "special format";
         return null;
     }
 
