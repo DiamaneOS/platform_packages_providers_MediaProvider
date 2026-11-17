@@ -129,15 +129,24 @@ filegroup {
         "src/**/*.java",
         ":statslog-mediaprovider-java-gen",
         ":mediaprovider-vmdecode-aidl",
+        ":mediaprovider-vmdecode-client",
     ],
 }
 
-// The decode service's API (de.diamaneos.sanitizer, IDecodeService). A copy of the files in
-// DiamaneOS/platform_packages_apps_Sanitizer: both sides change together.
+// The decode service's API (de.diamaneos.sanitizer, IDecodeService). An exact copy of the files in
+// DiamaneOS/platform_packages_apps_Sanitizer, compared with tools/check-client-copy.sh there.
 filegroup {
     name: "mediaprovider-vmdecode-aidl",
     srcs: ["vmdecode-aidl/**/*.aidl"],
     path: "vmdecode-aidl",
+}
+
+// The callers' checks of the decode service's replies (DecodeChecks), an exact copy of the decode service's
+// de.diamaneos.sanitizer.decode-client library. Compared with tools/check-client-copy.sh there. MediaProvider links that
+// library instead once the decode service is in the tree.
+filegroup {
+    name: "mediaprovider-vmdecode-client",
+    srcs: ["vmdecode-client/**/*.java"],
 }
 
 // This is defined to give LegacyMediaProvider the bare minimum it needs

@@ -13,7 +13,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package com.android.providers.media.vmdecode;
 
 import android.content.ComponentName;
@@ -29,20 +28,23 @@ import android.util.Log;
 
 import androidx.annotation.GuardedBy;
 import androidx.annotation.NonNull;
+import androidx.annotation.Nullable;
 
 import de.diamaneos.sanitizer.decode.IDecodeService;
 
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Future;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
 
 /**
- * The connection to the decode service. Binds on first use, only to the system app that holds the service, and puts
- * a deadline on every call. A service that is missing, not a system app, slow or gone makes every call fail with
- * {@link VmDecodeUnavailableException}. Nothing here ever decodes a file in MediaProvider.
+ * The connection to the decode service. Binds on first use, only to the system app that holds the service.
+ *
+ * <p>Calls run on two lanes with their own threads, user-waiting and background, so background work can never take
+ * the capacity of requests the user waits on. Inside a lane every owner (the package that supplied the bytes) has its
+ * own queue, served in turn, with a cap on what one owner can queue and run while others wait. A call has two
+ * deadlines: one for waiting in its queue, which fails it as unavailable and nothing else, and one from the moment it
+ * started. Only a call that started and then missed its deadline drops the binding, since only then has the service
+ * broken its own deadline. A missing, slow or dead service makes calls fail with {@link VmDecodeUnavailableException}.
+ * Nothing here ever decodes a file in MediaProvider.
  */
 final class DecodeClient {
     private static final String TAG = "VmDecode";
@@ -52,18 +54,12 @@ final class DecodeClient {
 
     private static final long CONNECT_TIMEOUT_USER_WAITING_MS = 3_000;
     private static final long CONNECT_TIMEOUT_BACKGROUND_MS = 15_000;
-    // A little longer than the service's own budgets (20 s and 60 s, queue included), so a miss here means the service
-    // broke its deadline.
+    private static final long QUEUE_TIMEOUT_USER_WAITING_MS = 10_000;
+    private static final long QUEUE_TIMEOUT_BACKGROUND_MS = 60_000;
+    // From the start of the call: a little longer than the service's own budgets (20 s and 60 s), so a miss here
+    // means the service broke its deadline.
     private static final long CALL_TIMEOUT_USER_WAITING_MS = 25_000;
     private static final long CALL_TIMEOUT_BACKGROUND_MS = 75_000;
-
-    // Two lanes with their own threads and queues, so background work (scans, idle maintenance) can never take the
-    // capacity of requests the user waits on. A call stuck past its deadline keeps its thread until the service
-    // answers or the binder dies: few threads, so a stuck service makes calls fail fast instead of piling threads up.
-    private static final int USER_WAITING_THREADS = 4;
-    private static final int USER_WAITING_QUEUE = 32;
-    private static final int BACKGROUND_THREADS = 2;
-    private static final int BACKGROUND_QUEUE = 64;
 
     /** One call to the service. */
     interface Call<T> {
@@ -71,8 +67,10 @@ final class DecodeClient {
     }
 
     private final Context mContext;
-    private final ThreadPoolExecutor mUserWaiting = lane(USER_WAITING_THREADS, USER_WAITING_QUEUE);
-    private final ThreadPoolExecutor mBackground = lane(BACKGROUND_THREADS, BACKGROUND_QUEUE);
+    // User-waiting: 4 threads, an owner may queue 8 and run 2 while others wait. Background: 2 threads, an owner may
+    // queue 16 and run 1 while others wait.
+    private final Lane mUserWaiting = new Lane("VmDecodeUser", 4, 8, 2);
+    private final Lane mBackground = new Lane("VmDecodeBackground", 2, 16, 1);
 
     private final Object mLock = new Object();
     @GuardedBy("mLock")
@@ -111,44 +109,115 @@ final class DecodeClient {
         mContext = context.getApplicationContext();
     }
 
-    private static ThreadPoolExecutor lane(int threads, int queue) {
-        final ThreadPoolExecutor executor = new ThreadPoolExecutor(threads, threads, 30, TimeUnit.SECONDS,
-                new LinkedBlockingQueue<>(queue), new ThreadPoolExecutor.AbortPolicy());
-        executor.allowCoreThreadTimeOut(true);
-        return executor;
-    }
-
-    /** Runs {@code call} against the service within the deadline for {@code priority}. */
-    <T> T call(int priority, @NonNull Call<T> call) throws VmDecodeUnavailableException,
-            VmDecodeRejectedException {
+    /** Runs {@code call} for the bytes of {@code owner} on the lane and within the deadlines of {@code priority}. */
+    <T> T call(int priority, @Nullable String owner, @NonNull Call<T> call)
+            throws VmDecodeUnavailableException, VmDecodeRejectedException {
         final boolean waiting = priority == IDecodeService.PRIORITY_USER_WAITING;
         final IDecodeService service = connect(waiting ? CONNECT_TIMEOUT_USER_WAITING_MS
                 : CONNECT_TIMEOUT_BACKGROUND_MS);
-        final Future<T> future;
-        try {
-            future = (waiting ? mUserWaiting : mBackground).submit(() -> call.run(service));
-        } catch (RuntimeException e) {
-            throw new VmDecodeUnavailableException("decode calls are all busy", e);
+        final Lane lane = waiting ? mUserWaiting : mBackground;
+        final String key = owner == null ? "" : owner;
+        final Task<T> task = new Task<>(() -> call.run(service));
+        if (!lane.queue.offer(key, task)) {
+            throw new VmDecodeUnavailableException("too many decode requests from " + key);
         }
+        lane.start();
         try {
-            return future.get(waiting ? CALL_TIMEOUT_USER_WAITING_MS : CALL_TIMEOUT_BACKGROUND_MS,
-                    TimeUnit.MILLISECONDS);
-        } catch (TimeoutException e) {
-            future.cancel(true);
-            // A service past its deadline is not trusted to recover by itself: drop the binding, the next call binds
-            // again.
-            unbind();
-            throw new VmDecodeUnavailableException("decode service missed its deadline", e);
+            if (!task.started.await(waiting ? QUEUE_TIMEOUT_USER_WAITING_MS : QUEUE_TIMEOUT_BACKGROUND_MS,
+                    TimeUnit.MILLISECONDS) && lane.queue.remove(key, task)) {
+                // Never started: the service is not at fault, the binding stays.
+                throw new VmDecodeUnavailableException("waited too long in the queue");
+            }
+            if (!task.done.await(waiting ? CALL_TIMEOUT_USER_WAITING_MS : CALL_TIMEOUT_BACKGROUND_MS,
+                    TimeUnit.MILLISECONDS)) {
+                // Started and not answered in time: the service broke its own deadline. Drop the binding, the next
+                // call binds again.
+                unbind();
+                throw new VmDecodeUnavailableException("decode service missed its deadline");
+            }
         } catch (InterruptedException e) {
-            future.cancel(true);
+            lane.queue.remove(key, task);
             Thread.currentThread().interrupt();
             throw new VmDecodeUnavailableException("interrupted", e);
-        } catch (ExecutionException e) {
-            final Throwable cause = e.getCause();
-            if (cause instanceof VmDecodeRejectedException) {
-                throw (VmDecodeRejectedException) cause;
+        }
+        if (task.error instanceof VmDecodeRejectedException) {
+            throw (VmDecodeRejectedException) task.error;
+        }
+        if (task.error != null) {
+            throw new VmDecodeUnavailableException("decode call failed", task.error);
+        }
+        return task.result;
+    }
+
+    /** A call waiting in a lane. */
+    private static final class Task<T> implements Runnable {
+        interface Work<T> {
+            T run() throws Exception;
+        }
+
+        final Work<T> work;
+        final CountDownLatch started = new CountDownLatch(1);
+        final CountDownLatch done = new CountDownLatch(1);
+        volatile T result;
+        volatile Throwable error;
+
+        Task(Work<T> work) {
+            this.work = work;
+        }
+
+        @Override
+        public void run() {
+            started.countDown();
+            try {
+                result = work.run();
+            } catch (Throwable t) {
+                error = t;
+            } finally {
+                done.countDown();
             }
-            throw new VmDecodeUnavailableException("decode call failed", cause);
+        }
+    }
+
+    /** Worker threads taking tasks from a fair queue. */
+    private static final class Lane {
+        final FairQueue<Runnable> queue;
+        private final String mName;
+        private final int mThreads;
+        @GuardedBy("this")
+        private boolean mStarted;
+
+        Lane(String name, int threads, int perOwnerQueued, int perOwnerRunning) {
+            mName = name;
+            mThreads = threads;
+            queue = new FairQueue<>(perOwnerQueued, perOwnerRunning);
+        }
+
+        synchronized void start() {
+            if (mStarted) {
+                return;
+            }
+            mStarted = true;
+            for (int i = 0; i < mThreads; i++) {
+                final Thread worker = new Thread(this::work, mName + i);
+                worker.setDaemon(true);
+                worker.start();
+            }
+        }
+
+        private void work() {
+            while (true) {
+                final FairQueue.Owned<Runnable> next;
+                try {
+                    next = queue.take();
+                } catch (InterruptedException e) {
+                    return;
+                }
+                try {
+                    next.item.run();
+                } finally {
+                    queue.done(next.owner);
+                }
+            }
         }
     }
 

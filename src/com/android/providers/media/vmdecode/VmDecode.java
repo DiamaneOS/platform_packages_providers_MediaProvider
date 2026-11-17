@@ -40,6 +40,7 @@ import androidx.annotation.Nullable;
 
 import com.android.providers.media.util.MimeUtils;
 
+import de.diamaneos.sanitizer.decode.DecodeChecks;
 import de.diamaneos.sanitizer.decode.DecodeRequest;
 import de.diamaneos.sanitizer.decode.IDecodeService;
 import de.diamaneos.sanitizer.decode.ImageInfo;
@@ -142,17 +143,14 @@ public final class VmDecode {
         if (rejected != null) {
             throw new VmDecodeRejectedException(rejected);
         }
-        try (ParcelFileDescriptor pfd = ParcelFileDescriptor.open(file,
-                ParcelFileDescriptor.MODE_READ_ONLY)) {
+        try (ParcelFileDescriptor opened = ParcelFileDescriptor.open(file,
+                ParcelFileDescriptor.MODE_READ_ONLY);
+                ParcelFileDescriptor pfd = safeSource(opened, owner, true)) {
             final DecodeRequest request = request(pfd, owner, priority, mimeOf(file));
-            final Info info = client().call(priority, service -> {
+            final Info info = client().call(priority, owner, service -> {
                 final ImageInfo reply = service.probe(request);
-                checkStatus(reply == null ? -1 : reply.status);
-                try {
-                    StripeValidator.checkInfo(reply.format, reply.width, reply.height, reply.animated);
-                } catch (StripeValidator.BadReplyException e) {
-                    throw new VmDecodeRejectedException("bad probe reply: " + e.getMessage());
-                }
+                checkReply(reply == null, DecodeChecks.check(reply));
+                checkStatus(reply.status);
                 return new Info(reply.format, reply.width, reply.height, reply.animated);
             });
             sProbeCache.put(key, info);
@@ -166,8 +164,9 @@ public final class VmDecode {
     /** A thumbnail of an image file that fits in {@code size}, turned upright. */
     public static @NonNull Bitmap imageThumbnail(@NonNull File file, @NonNull Size size, @Nullable String owner,
             @Nullable CancellationSignal signal) throws IOException {
-        try (ParcelFileDescriptor pfd = ParcelFileDescriptor.open(file,
-                ParcelFileDescriptor.MODE_READ_ONLY)) {
+        try (ParcelFileDescriptor opened = ParcelFileDescriptor.open(file,
+                ParcelFileDescriptor.MODE_READ_ONLY);
+                ParcelFileDescriptor pfd = safeSource(opened, owner, false)) {
             return decode(pfd, owner, PRIORITY_USER_WAITING, mimeOf(file), size.getWidth(), size.getHeight(),
                     signal);
         }
@@ -268,11 +267,14 @@ public final class VmDecode {
      */
     public static @NonNull Bitmap decodeForDisplay(@NonNull ContentResolver resolver, @NonNull Uri uri,
             @Nullable String owner, int maxWidth, int maxHeight) throws IOException {
-        try (ParcelFileDescriptor pfd = resolver.openFileDescriptor(uri, "r")) {
-            if (pfd == null) {
+        try (ParcelFileDescriptor opened = resolver.openFileDescriptor(uri, "r")) {
+            if (opened == null) {
                 throw new FileNotFoundException("no file for " + uri);
             }
-            return decode(pfd, owner, PRIORITY_USER_WAITING, resolver.getType(uri), maxWidth, maxHeight, null);
+            try (ParcelFileDescriptor pfd = safeSource(opened, owner, false)) {
+                return decode(pfd, owner, PRIORITY_USER_WAITING, resolver.getType(uri), maxWidth, maxHeight,
+                        null);
+            }
         }
     }
 
@@ -287,6 +289,15 @@ public final class VmDecode {
         final ParcelFileDescriptor pfd = asset.getParcelFileDescriptor();
         final long offset = asset.getStartOffset();
         final long length = asset.getDeclaredLength();
+        if (SourceReader.onFuse(pfd)) {
+            // Even a stat can stall on FUSE: everything happens on a reader thread with a deadline, and the
+            // service gets a memory file.
+            final byte[] bytes = SourceReader.read(pfd, offset, length, IDecodeService.MAX_INPUT_BYTES, false,
+                    owner, COPY_DEADLINE_MILLIS);
+            try (ParcelFileDescriptor memory = memoryFile(bytes, bytes.length)) {
+                return decode(memory, owner, priority, null, maxWidth, maxHeight, signal);
+            }
+        }
         final StructStat st;
         try {
             st = Os.fstat(pfd.getFileDescriptor());
@@ -311,22 +322,20 @@ public final class VmDecode {
     /** The checked metadata record of an image. */
     public static @NonNull Metadata readMetadata(@NonNull File file, @Nullable String owner, int priority)
             throws IOException {
-        try (ParcelFileDescriptor pfd = ParcelFileDescriptor.open(file,
-                ParcelFileDescriptor.MODE_READ_ONLY)) {
+        try (ParcelFileDescriptor opened = ParcelFileDescriptor.open(file,
+                ParcelFileDescriptor.MODE_READ_ONLY);
+                ParcelFileDescriptor pfd = safeSource(opened, owner, false)) {
             final DecodeRequest request = request(pfd, owner, priority, mimeOf(file));
-            return client().call(priority, service -> {
+            return client().call(priority, owner, service -> {
                 final MetadataRecord reply = service.readMetadata(request);
-                checkStatus(reply == null ? -1 : reply.status);
-                try {
-                    return Metadata.check(reply, System.currentTimeMillis());
-                } catch (StripeValidator.BadReplyException e) {
-                    throw new VmDecodeRejectedException("bad metadata reply: " + e.getMessage());
-                }
+                checkReply(reply == null, DecodeChecks.check(reply, System.currentTimeMillis()));
+                checkStatus(reply.status);
+                return new Metadata(reply);
             });
         }
     }
 
-    /** {@link MetadataRecord} after every field passed its rule. */
+    /** {@link MetadataRecord} after every field passed its rule (DecodeChecks). */
     public static final class Metadata {
         public final int format;
         public final int width;
@@ -346,33 +355,25 @@ public final class VmDecode {
         public final String originalDocumentId;
         public final int specialFormat;
 
-        private Metadata(MetadataRecord r, long nowMillis) throws StripeValidator.BadReplyException {
-            StripeValidator.checkInfo(r.format, r.width, r.height);
+        /** Only after DecodeChecks.check passed. */
+        private Metadata(MetadataRecord r) {
             format = r.format;
             width = r.width;
             height = r.height;
-            orientation = StripeValidator.checkOrientation(r.orientation);
-            dateTakenMillis = StripeValidator.checkDateTaken(r.dateTakenMillis, r.offsetKnown, nowMillis);
+            orientation = r.orientation;
+            dateTakenMillis = r.dateTakenMillis;
             offsetKnown = r.offsetKnown;
-            StripeValidator.checkLocation(r.latitude, r.longitude);
             latitude = r.latitude;
             longitude = r.longitude;
-            description = StripeValidator.checkText(r.description, StripeValidator.MAX_TEXT_CHARS);
-            exposureTime = StripeValidator.checkNumber(r.exposureTime);
-            fNumber = StripeValidator.checkNumber(r.fNumber);
-            iso = StripeValidator.checkNumber(r.iso);
-            sceneCaptureType = StripeValidator.checkNumber(r.sceneCaptureType);
-            documentId = StripeValidator.checkId(r.documentId);
-            instanceId = StripeValidator.checkId(r.instanceId);
-            originalDocumentId = StripeValidator.checkId(r.originalDocumentId);
-            if (r.specialFormat < 0 || r.specialFormat > 3) {
-                throw new StripeValidator.BadReplyException("bad special format " + r.specialFormat);
-            }
+            description = r.description;
+            exposureTime = r.exposureTime;
+            fNumber = r.fNumber;
+            iso = r.iso;
+            sceneCaptureType = r.sceneCaptureType;
+            documentId = r.documentId;
+            instanceId = r.instanceId;
+            originalDocumentId = r.originalDocumentId;
             specialFormat = r.specialFormat;
-        }
-
-        static Metadata check(MetadataRecord r, long nowMillis) throws StripeValidator.BadReplyException {
-            return new Metadata(r, nowMillis);
         }
     }
 
@@ -410,6 +411,22 @@ public final class VmDecode {
         return memoryFile(buffer, length);
     }
 
+    /**
+     * The descriptor to hand to the service. A file on FUSE is read here first, on a reader thread with a deadline
+     * (at most MAX_PROBE_BYTES for a probe), and the service gets a memory file, so a stalling FUSE daemon can hold
+     * up neither MediaProvider nor the service. Anything else goes as it is, as a new descriptor the caller closes.
+     */
+    private static ParcelFileDescriptor safeSource(ParcelFileDescriptor pfd, @Nullable String owner,
+            boolean probe) throws IOException {
+        if (!SourceReader.onFuse(pfd)) {
+            return pfd.dup();
+        }
+        final byte[] bytes = SourceReader.read(pfd, 0, -1,
+                probe ? IDecodeService.MAX_PROBE_BYTES : IDecodeService.MAX_INPUT_BYTES, probe, owner,
+                COPY_DEADLINE_MILLIS);
+        return memoryFile(bytes, bytes.length);
+    }
+
     private static ParcelFileDescriptor memoryFile(byte[] bytes, int length) throws IOException {
         FileDescriptor fd = null;
         try {
@@ -437,25 +454,30 @@ public final class VmDecode {
             @Nullable String mimeType, int maxWidth, int maxHeight, @Nullable CancellationSignal signal)
             throws IOException {
         final DecodeRequest request = request(pfd, owner, priority, mimeType);
-        return client().call(priority, service -> {
+        return client().call(priority, owner, service -> {
             final Thumbnail reply = service.decodeThumbnail(request, maxWidth, maxHeight);
-            checkStatus(reply == null ? -1 : reply.status);
+            checkReply(reply == null, DecodeChecks.check(reply, maxWidth, maxHeight));
+            checkStatus(reply.status);
             try {
-                final int stripes = StripeValidator.checkHeader(reply.width, reply.height, reply.stripeRows,
-                        reply.rotation, maxWidth, maxHeight);
-                final byte[] frame = new byte[reply.width * reply.height * 4];
+                // Every stripe is checked by DecodeChecks (exact length, no colour above alpha) before it is
+                // copied, so the frame only ever holds valid premultiplied pixels of the checked size.
+                final int rowBytes = reply.width * 4;
+                final int stripes = (reply.height + reply.stripeRows - 1) / reply.stripeRows;
+                final byte[] frame = new byte[rowBytes * reply.height];
                 for (int i = 0; i < stripes; i++) {
                     if (signal != null && signal.isCanceled()) {
                         throw new RemoteException("canceled");
                     }
-                    StripeValidator.putStripe(frame, reply.width, reply.height, reply.stripeRows, i,
-                            service.readStripe(reply.handle, i));
+                    final byte[] stripe = service.readStripe(reply.handle, i);
+                    final String bad = DecodeChecks.check(reply, i, stripe);
+                    if (bad != null) {
+                        throw new VmDecodeRejectedException("bad stripe " + i + ": " + bad);
+                    }
+                    System.arraycopy(stripe, 0, frame, i * reply.stripeRows * rowBytes, stripe.length);
                 }
                 final Bitmap bitmap = Bitmap.createBitmap(reply.width, reply.height, Bitmap.Config.ARGB_8888);
                 bitmap.copyPixelsFromBuffer(ByteBuffer.wrap(frame));
                 return rotate(bitmap, reply.rotation);
-            } catch (StripeValidator.BadReplyException e) {
-                throw new VmDecodeRejectedException("bad thumbnail reply: " + e.getMessage());
             } finally {
                 try {
                     service.release(reply.handle);
@@ -467,13 +489,22 @@ public final class VmDecode {
     }
 
     /**
-     * Maps a reply status: OK returns, unavailable or no reply (-1) become a RemoteException, so the call counts as
-     * unavailable, and the rest reject the file.
+     * A reply that broke the contract (DecodeChecks) rejects the file, like STATUS_INVALID. No reply at all counts as
+     * unavailable.
      */
+    private static void checkReply(boolean missing, @Nullable String bad)
+            throws RemoteException, VmDecodeRejectedException {
+        if (missing) {
+            throw new RemoteException("no reply");
+        }
+        if (bad != null) {
+            throw new VmDecodeRejectedException("reply broke the contract: " + bad);
+        }
+    }
+
+    /** Maps a checked reply's status: OK returns, unavailable counts as unavailable, the rest reject the file. */
     private static void checkStatus(int status) throws RemoteException, VmDecodeRejectedException {
         switch (status) {
-            case -1:
-                throw new RemoteException("no reply");
             case IDecodeService.STATUS_OK:
                 return;
             case IDecodeService.STATUS_UNAVAILABLE:
