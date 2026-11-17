@@ -21,8 +21,10 @@ package de.diamaneos.sanitizer.decode;
  */
 parcelable DecodeRequest {
     /**
-     * The bytes, opened read-only by the caller. A regular file or a pipe. The service reads at most
-     * IDecodeService.MAX_INPUT_BYTES and hands them to the VM as opaque bytes, it never parses them itself.
+     * The bytes, opened read-only by the caller. A regular file, a memory file or a pipe, possibly from another app.
+     * The service reads it under its own deadline (a pipe that stalls or never ends cannot hold anyone up), at most
+     * IDecodeService.MAX_INPUT_BYTES (MAX_PROBE_BYTES for a probe), and hands the bytes to the VM unopened. It never
+     * parses them itself.
      */
     ParcelFileDescriptor file;
 

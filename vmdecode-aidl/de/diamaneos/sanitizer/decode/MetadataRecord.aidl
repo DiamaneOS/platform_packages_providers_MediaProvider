@@ -32,7 +32,11 @@ parcelable MetadataRecord {
     /** 0, 90, 180, 270, or -1. */
     int orientation;
 
-    /** DateTimeOriginal in UTC milliseconds, -1 when absent. offsetKnown when OffsetTimeOriginal was present. */
+    /**
+     * DateTimeOriginal in UTC milliseconds, -1 when absent (and then offsetKnown is false). Otherwise from 1900-01-01
+     * to 9999-12-31 with a day of slack, and at most a day after the current time. offsetKnown when
+     * OffsetTimeOriginal was present.
+     */
     long dateTakenMillis;
     boolean offsetKnown;
 
@@ -40,7 +44,11 @@ parcelable MetadataRecord {
     double latitude;
     double longitude;
 
-    /** Printable text, at most MAX_TEXT_CHARS, no control or bidi characters. */
+    /**
+     * Printable text, at most MAX_TEXT_CHARS: no control characters (C0, DEL, C1), no line or paragraph separators,
+     * no bidi controls (U+061C, U+200E, U+200F, U+202A to U+202E, U+2066 to U+2069), no zero-width characters
+     * (U+180E, U+200B to U+200D, U+2060, U+FEFF), no unpaired surrogates.
+     */
     String description;
 
     /** EXIF numbers as text: at most MAX_NUMBER_CHARS of 0-9 . / and space. */

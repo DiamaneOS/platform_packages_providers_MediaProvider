@@ -90,14 +90,47 @@ public class StripeValidatorTest {
     }
 
     @Test
+    public void animationOnlyWhereFormatsAnimate() throws Exception {
+        StripeValidator.checkInfo(3, 10, 10, true);
+        StripeValidator.checkInfo(4, 10, 10, true);
+        StripeValidator.checkInfo(2, 10, 10, true);
+        StripeValidator.checkInfo(1, 10, 10, false);
+        assertThrows(BadReplyException.class, () -> StripeValidator.checkInfo(1, 10, 10, true));
+        assertThrows(BadReplyException.class, () -> StripeValidator.checkInfo(5, 10, 10, true));
+        assertThrows(BadReplyException.class, () -> StripeValidator.checkInfo(0, 10, 10, true));
+    }
+
+    @Test
+    public void dateTaken() throws Exception {
+        final long now = 1794873000000L;
+        assertEquals(-1, StripeValidator.checkDateTaken(-1, false, now));
+        assertEquals(now, StripeValidator.checkDateTaken(now, true, now));
+        assertEquals(now + 86400000L, StripeValidator.checkDateTaken(now + 86400000L, false, now));
+        assertThrows(BadReplyException.class, () -> StripeValidator.checkDateTaken(now + 86400001L, false, now));
+        assertThrows(BadReplyException.class, () -> StripeValidator.checkDateTaken(-1, true, now));
+        // Dates before 1970 are real dates: only -1 means none.
+        assertEquals(-2, StripeValidator.checkDateTaken(-2, false, now));
+        assertThrows(BadReplyException.class,
+                () -> StripeValidator.checkDateTaken(-2208988800000L - 86400001L, false, now));
+        assertThrows(BadReplyException.class, () -> StripeValidator.checkDateTaken(Long.MAX_VALUE, false, now));
+    }
+
+    @Test
     public void textRules() throws Exception {
         assertEquals("", StripeValidator.checkText(null, 10));
-        assertEquals("Holiday été 😀", StripeValidator.checkText("Holiday été 😀", 20));
+        assertEquals("Holiday \u00e9t\u00e9 \ud83d\ude00", StripeValidator.checkText("Holiday \u00e9t\u00e9 \ud83d\ude00", 20));
         assertThrows(BadReplyException.class, () -> StripeValidator.checkText("a\nb", 10));
         assertThrows(BadReplyException.class, () -> StripeValidator.checkText("a\u0085b", 10));
         assertThrows(BadReplyException.class, () -> StripeValidator.checkText("a\u009bb", 10));
-        assertThrows(BadReplyException.class, () -> StripeValidator.checkText("a‮b", 10));
-        assertThrows(BadReplyException.class, () -> StripeValidator.checkText("a⁦b", 10));
+        assertThrows(BadReplyException.class, () -> StripeValidator.checkText("a\u202eb", 10));
+        assertThrows(BadReplyException.class, () -> StripeValidator.checkText("a\u2066b", 10));
+        assertThrows(BadReplyException.class, () -> StripeValidator.checkText("a\u2028b", 10));
+        assertThrows(BadReplyException.class, () -> StripeValidator.checkText("a\u2029b", 10));
+        assertThrows(BadReplyException.class, () -> StripeValidator.checkText("a\u061cb", 10));
+        assertThrows(BadReplyException.class, () -> StripeValidator.checkText("a\u200bb", 10));
+        assertThrows(BadReplyException.class, () -> StripeValidator.checkText("a\u200db", 10));
+        assertThrows(BadReplyException.class, () -> StripeValidator.checkText("a\u2060b", 10));
+        assertThrows(BadReplyException.class, () -> StripeValidator.checkText("a\u180eb", 10));
         assertThrows(BadReplyException.class, () -> StripeValidator.checkText("a\ud800b", 10));
         assertThrows(BadReplyException.class, () -> StripeValidator.checkText("a\udc00", 10));
         assertThrows(BadReplyException.class, () -> StripeValidator.checkText("abcdefghijk", 10));

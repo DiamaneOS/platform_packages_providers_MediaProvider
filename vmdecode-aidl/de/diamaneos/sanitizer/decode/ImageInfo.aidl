@@ -28,6 +28,6 @@ parcelable ImageInfo {
     int width;
     int height;
 
-    /** True for a GIF or WebP with more than one frame. */
+    /** True for an image with more than one frame. Only GIF, WebP, PNG (APNG), HEIF and AVIF can be animated. */
     boolean animated;
 }

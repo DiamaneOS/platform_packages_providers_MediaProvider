@@ -18,9 +18,12 @@ package com.android.providers.media.photopicker.data.glide;
 
 import android.content.ContentResolver;
 import android.content.Context;
+import android.content.pm.ProviderInfo;
 import android.content.res.AssetFileDescriptor;
+import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.graphics.Point;
+import android.net.Uri;
 import android.os.Bundle;
 import android.os.CancellationSignal;
 import android.provider.CloudMediaProviderContract;
@@ -30,6 +33,7 @@ import android.util.Log;
 
 import androidx.annotation.Nullable;
 
+import com.android.providers.media.photopicker.PickerSyncController;
 import com.android.providers.media.vmdecode.VmDecode;
 
 import com.bumptech.glide.Priority;
@@ -101,11 +105,10 @@ public class PickerThumbnailFetcher implements DataFetcher<InputStream> {
             final int screen = Math.max(metrics.widthPixels, metrics.heightPixels);
             final int maxWidth = mWidth > 0 ? mWidth : screen;
             final int maxHeight = mHeight > 0 ? mHeight : screen;
-            final Bitmap bitmap;
-            try (InputStream original = mAssetFileDescriptor.createInputStream()) {
-                bitmap = VmDecode.decodeStream(original, /* owner= */ null,
-                        VmDecode.PRIORITY_USER_WAITING, maxWidth, maxHeight, mCancellationSignal);
-            }
+            // The descriptor goes to the decode service as it is: a provider that stalls or never ends is
+            // read by the service under its own deadline, never by a thread here.
+            final Bitmap bitmap = VmDecode.decodeAsset(mAssetFileDescriptor, ownerOf(mModel.getLoadableUri()),
+                    VmDecode.PRIORITY_USER_WAITING, maxWidth, maxHeight, mCancellationSignal);
             final ByteArrayOutputStream png = new ByteArrayOutputStream();
             bitmap.compress(Bitmap.CompressFormat.PNG, 100, png);
             bitmap.recycle();
@@ -120,6 +123,29 @@ public class PickerThumbnailFetcher implements DataFetcher<InputStream> {
      * Cleanup is called after Glide is done with this Fetcher instance, and it is now safe to close
      * the remembered AssetFileDescriptor.
      */
+    /**
+     * The package that supplied the bytes, for the decode service's fair queue: the media item's owner for the local
+     * provider, the cloud media provider's package otherwise. Null when unknown.
+     */
+    @Nullable
+    private String ownerOf(Uri uri) {
+        try {
+            final String authority = uri.getAuthority();
+            if (PickerSyncController.LOCAL_PICKER_PROVIDER_AUTHORITY.equals(authority)) {
+                final String id = uri.getLastPathSegment();
+                final Uri item = MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL, Long.parseLong(id));
+                try (Cursor c = mContext.getContentResolver().query(item,
+                        new String[] {MediaStore.MediaColumns.OWNER_PACKAGE_NAME}, null, null)) {
+                    return c != null && c.moveToFirst() ? c.getString(0) : null;
+                }
+            }
+            final ProviderInfo provider = mContext.getPackageManager().resolveContentProvider(authority, 0);
+            return provider != null ? provider.packageName : null;
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
     @Override
     public void cleanup() {
         try {

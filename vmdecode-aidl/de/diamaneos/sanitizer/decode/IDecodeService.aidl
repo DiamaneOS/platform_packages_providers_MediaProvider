@@ -53,7 +53,10 @@ interface IDecodeService {
     const int FORMAT_ICO = 9;
     const int FORMAT_WBMP = 10;
 
+    /** Thumbnails and metadata: a longer input is refused (STATUS_INVALID). */
     const int MAX_INPUT_BYTES = 33554432;
+    /** A probe reads at most this much from the start of the input, so it works for inputs of any size. */
+    const int MAX_PROBE_BYTES = 1048576;
     const int MAX_DIMENSION = 65535;
     const int MAX_PIXELS = 8388608;
     const int MAX_STRIPE_BYTES = 262144;
@@ -62,7 +65,7 @@ interface IDecodeService {
     const int MAX_ID_CHARS = 128;
     const int HANDLE_TIMEOUT_MILLIS = 30000;
 
-    /** Header only: format, size, animation. No pixels are decoded. */
+    /** Header only: format, size, animation, from at most MAX_PROBE_BYTES. No pixels are decoded. */
     ImageInfo probe(in DecodeRequest request);
 
     /**

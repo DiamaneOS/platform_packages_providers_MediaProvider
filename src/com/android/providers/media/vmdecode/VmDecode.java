@@ -18,15 +18,18 @@ package com.android.providers.media.vmdecode;
 
 import android.content.ContentResolver;
 import android.content.Context;
+import android.content.res.AssetFileDescriptor;
 import android.graphics.Bitmap;
 import android.graphics.Matrix;
 import android.media.MediaMetadataRetriever;
 import android.net.Uri;
 import android.os.CancellationSignal;
+import android.os.Environment;
 import android.os.ParcelFileDescriptor;
 import android.os.RemoteException;
 import android.system.ErrnoException;
 import android.system.Os;
+import android.system.OsConstants;
 import android.system.StructStat;
 import android.util.Log;
 import android.util.LruCache;
@@ -44,19 +47,22 @@ import de.diamaneos.sanitizer.decode.MetadataRecord;
 import de.diamaneos.sanitizer.decode.Thumbnail;
 
 import java.io.File;
+import java.io.FileDescriptor;
 import java.io.FileNotFoundException;
-import java.io.FileOutputStream;
 import java.io.IOException;
-import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.Locale;
+import java.util.Objects;
+import java.util.function.ToIntFunction;
 
 /**
  * Image decoding for MediaProvider, done in a protected VM by the decode service (de.diamaneos.sanitizer). MediaProvider
- * hands over the file as opaque bytes and gets back checked pixels or checked numbers. It never runs an image decoder
- * on a file itself: when the service is unavailable every method throws {@link VmDecodeUnavailableException} and the
- * caller shows a placeholder or stores nothing and asks again later. There is no setting or flag that turns this off.
+ * hands over the bytes unopened (a file descriptor, never parsed here) and gets back checked pixels or checked numbers.
+ * It never runs an image decoder on those bytes itself: when the service is unavailable every method throws
+ * {@link VmDecodeUnavailableException} and the caller shows a placeholder or stores nothing and asks again later. There
+ * is no setting or flag that turns this off.
  */
 public final class VmDecode {
     private static final String TAG = "VmDecode";
@@ -64,12 +70,17 @@ public final class VmDecode {
     public static final int PRIORITY_USER_WAITING = IDecodeService.PRIORITY_USER_WAITING;
     public static final int PRIORITY_BACKGROUND = IDecodeService.PRIORITY_BACKGROUND;
 
+    // Copying a region of a regular file into memory for the service: a deadline for the whole copy.
+    private static final long COPY_DEADLINE_MILLIS = 10_000;
+
     private static final Object sLock = new Object();
     private static DecodeClient sClient;
 
-    // Probe results by file identity (device, inode, size, change times). The service keeps its own cache by content
-    // hash, since it reads every byte anyway. Here a stat is enough and costs no reading.
+    // Probe answers by file identity (device, inode, size, both change times). Rejections are kept too, for this
+    // process's life, so an undecodable file is not sent again and again until it changes. The service keeps its own
+    // cache by content hash, since it reads the bytes anyway, and here a stat is enough.
     private static final LruCache<String, Info> sProbeCache = new LruCache<>(512);
+    private static final LruCache<String, String> sRejectedCache = new LruCache<>(512);
 
     private VmDecode() {
     }
@@ -115,13 +126,21 @@ public final class VmDecode {
         }
     }
 
-    /** Format, size and animation of an image, from its header. Cached by file identity. */
+    /**
+     * Format, size and animation of an image, from its header. The service reads at most
+     * IDecodeService.MAX_PROBE_BYTES from the start of the file, so this works for files of any size. Cached by file
+     * identity, rejections included.
+     */
     public static @NonNull Info probe(@NonNull File file, @Nullable String owner, int priority)
             throws IOException {
         final String key = identity(file);
         final Info cached = sProbeCache.get(key);
         if (cached != null) {
             return cached;
+        }
+        final String rejected = sRejectedCache.get(key);
+        if (rejected != null) {
+            throw new VmDecodeRejectedException(rejected);
         }
         try (ParcelFileDescriptor pfd = ParcelFileDescriptor.open(file,
                 ParcelFileDescriptor.MODE_READ_ONLY)) {
@@ -130,7 +149,7 @@ public final class VmDecode {
                 final ImageInfo reply = service.probe(request);
                 checkStatus(reply == null ? -1 : reply.status);
                 try {
-                    StripeValidator.checkInfo(reply.format, reply.width, reply.height);
+                    StripeValidator.checkInfo(reply.format, reply.width, reply.height, reply.animated);
                 } catch (StripeValidator.BadReplyException e) {
                     throw new VmDecodeRejectedException("bad probe reply: " + e.getMessage());
                 }
@@ -138,6 +157,9 @@ public final class VmDecode {
             });
             sProbeCache.put(key, info);
             return info;
+        } catch (VmDecodeRejectedException e) {
+            sRejectedCache.put(key, e.getMessage() == null ? "rejected" : e.getMessage());
+            throw e;
         }
     }
 
@@ -152,95 +174,138 @@ public final class VmDecode {
     }
 
     /**
-     * A thumbnail for an audio file: the embedded picture, or an album art file next to it. MediaMetadataRetriever only
-     * extracts the embedded picture's bytes, in the media sandbox. The bytes are decoded in the VM.
+     * A thumbnail for an audio file, like ThumbnailUtils.createAudioThumbnail: the embedded picture, otherwise the best
+     * album art file next to it. MediaMetadataRetriever only extracts the picture's bytes, in the media sandbox. The
+     * bytes and the art files are decoded in the VM.
      */
     public static @NonNull Bitmap audioThumbnail(@NonNull File file, @NonNull Size size, @Nullable String owner,
             @Nullable CancellationSignal signal) throws IOException {
-        byte[] picture = null;
+        if (signal != null) {
+            signal.throwIfCanceled();
+        }
+        final byte[] picture;
         try (MediaMetadataRetriever retriever = new MediaMetadataRetriever()) {
             retriever.setDataSource(file.getAbsolutePath());
             picture = retriever.getEmbeddedPicture();
         } catch (RuntimeException e) {
-            Log.w(TAG, "no embedded picture: " + e.getMessage());
+            throw new IOException("Failed to create thumbnail", e);
         }
         if (picture != null) {
             return decodeBytes(picture, owner, size, signal);
         }
-        // Album art files in the same folder, the largest first, like ThumbnailUtils.
+
+        // The same search as ThumbnailUtils: only on external storage, not in Download or a top-level folder.
+        if (Environment.MEDIA_UNKNOWN.equals(Environment.getExternalStorageState(file))) {
+            throw new IOException("No embedded album art found");
+        }
         final File parent = file.getParentFile();
+        final File grandParent = parent != null ? parent.getParentFile() : null;
+        if (parent != null && parent.getName().equals(Environment.DIRECTORY_DOWNLOADS)) {
+            throw new IOException("No thumbnails in Downloads directories");
+        }
+        if (grandParent != null
+                && Environment.MEDIA_UNKNOWN.equals(Environment.getExternalStorageState(grandParent))) {
+            throw new IOException("No thumbnails in top-level directories");
+        }
         final File[] found = parent == null ? null : parent.listFiles((dir, name) -> {
             final String lower = name.toLowerCase(Locale.ROOT);
-            return (lower.startsWith("albumart") || lower.startsWith("cover") || lower.startsWith("folder"))
-                    && (lower.endsWith(".jpg") || lower.endsWith(".jpeg") || lower.endsWith(".png"));
+            return lower.endsWith(".jpg") || lower.endsWith(".png");
         });
-        if (found != null) {
-            Arrays.sort(found, (a, b) -> Long.compare(b.length(), a.length()));
-            for (File art : found) {
-                try {
-                    return imageThumbnail(art, size, owner, signal);
-                } catch (VmDecodeRejectedException e) {
-                    Log.w(TAG, "album art not usable: " + art.getName());
-                }
-            }
+        if (found == null || found.length == 0) {
+            throw new IOException("No album art found");
         }
-        throw new FileNotFoundException("No album art found");
+        final ToIntFunction<File> score = (f) -> {
+            final String lower = f.getName().toLowerCase(Locale.ROOT);
+            if (lower.equals("albumart.jpg")) return 4;
+            if (lower.startsWith("albumart") && lower.endsWith(".jpg")) return 3;
+            if (lower.contains("albumart") && lower.endsWith(".jpg")) return 2;
+            if (lower.endsWith(".jpg")) return 1;
+            return 0;
+        };
+        final File best = Arrays.stream(found).max(Comparator.comparingInt(score)).orElse(null);
+        if (signal != null) {
+            signal.throwIfCanceled();
+        }
+        return imageThumbnail(Objects.requireNonNull(best), size, owner, signal);
+    }
+
+    /**
+     * A thumbnail for a video file, like ThumbnailUtils.createVideoThumbnail: the embedded picture (decoded in the
+     * VM), otherwise a frame from MediaMetadataRetriever, which the media server decodes in its own sandbox.
+     */
+    public static @NonNull Bitmap videoThumbnail(@NonNull File file, @NonNull Size size, @Nullable String owner,
+            @Nullable CancellationSignal signal) throws IOException {
+        if (signal != null) {
+            signal.throwIfCanceled();
+        }
+        try (MediaMetadataRetriever mmr = new MediaMetadataRetriever()) {
+            mmr.setDataSource(file.getAbsolutePath());
+            final byte[] picture = mmr.getEmbeddedPicture();
+            if (picture != null) {
+                return decodeBytes(picture, owner, size, signal);
+            }
+            final MediaMetadataRetriever.BitmapParams params = new MediaMetadataRetriever.BitmapParams();
+            params.setPreferredConfig(Bitmap.Config.ARGB_8888);
+            final int width = Integer.parseInt(
+                    mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH));
+            final int height = Integer.parseInt(
+                    mmr.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT));
+            final long thumbnailTimeUs = -1;
+            if (size.getWidth() > width && size.getHeight() > height) {
+                return Objects.requireNonNull(mmr.getFrameAtTime(thumbnailTimeUs,
+                        MediaMetadataRetriever.OPTION_CLOSEST_SYNC, params));
+            }
+            return Objects.requireNonNull(mmr.getScaledFrameAtTime(thumbnailTimeUs,
+                    MediaMetadataRetriever.OPTION_CLOSEST_SYNC, size.getWidth(), size.getHeight(), params));
+        } catch (RuntimeException e) {
+            throw new IOException("Failed to create thumbnail", e);
+        }
     }
 
     /**
      * An image from a content URI for display, fitting in {@code maxWidth} x {@code maxHeight}. For screens that show a
      * full image, such as the permission dialog.
      */
-    public static @NonNull Bitmap decodeForDisplay(@NonNull ContentResolver resolver, @NonNull Uri uri, int maxWidth,
-            int maxHeight) throws IOException {
+    public static @NonNull Bitmap decodeForDisplay(@NonNull ContentResolver resolver, @NonNull Uri uri,
+            @Nullable String owner, int maxWidth, int maxHeight) throws IOException {
         try (ParcelFileDescriptor pfd = resolver.openFileDescriptor(uri, "r")) {
             if (pfd == null) {
                 throw new FileNotFoundException("no file for " + uri);
             }
-            return decode(pfd, null, PRIORITY_USER_WAITING, resolver.getType(uri), maxWidth, maxHeight, null);
+            return decode(pfd, owner, PRIORITY_USER_WAITING, resolver.getType(uri), maxWidth, maxHeight, null);
         }
     }
 
     /**
-     * An image from a stream, such as a cloud media provider's reply, fitting in {@code maxWidth} x {@code maxHeight}.
-     * At most IDecodeService.MAX_INPUT_BYTES are read, a longer stream is rejected.
+     * An image from an asset, such as a thumbnail or a cloud media provider's reply, fitting in {@code maxWidth} x
+     * {@code maxHeight}. The descriptor goes to the service as it is, so a pipe that never ends or stalls is read by
+     * the service with its own deadline and limit, never by a thread here. Only a part of a regular file (an asset
+     * with an offset or a shorter length) is copied, into a memory file, under a deadline.
      */
-    public static @NonNull Bitmap decodeStream(@NonNull InputStream in, @Nullable String owner, int priority,
-            int maxWidth, int maxHeight, @Nullable CancellationSignal signal) throws IOException {
-        final ParcelFileDescriptor[] pipe = ParcelFileDescriptor.createPipe();
-        final boolean[] tooLong = new boolean[1];
-        final Thread writer = new Thread(() -> {
-            try (FileOutputStream out = new ParcelFileDescriptor.AutoCloseOutputStream(pipe[1])) {
-                final byte[] buffer = new byte[65536];
-                long total = 0;
-                int n;
-                while ((n = in.read(buffer)) > 0) {
-                    total += n;
-                    if (total > IDecodeService.MAX_INPUT_BYTES) {
-                        tooLong[0] = true;
-                        return;
-                    }
-                    out.write(buffer, 0, n);
-                }
-            } catch (IOException e) {
-                // The service stopped reading, or the source failed: the reply says what happened.
-            }
-        }, "VmDecodeStream");
-        writer.start();
-        final Bitmap bitmap;
-        try (ParcelFileDescriptor read = pipe[0]) {
-            bitmap = decode(read, owner, priority, null, maxWidth, maxHeight, signal);
-        }
+    public static @NonNull Bitmap decodeAsset(@NonNull AssetFileDescriptor asset, @Nullable String owner,
+            int priority, int maxWidth, int maxHeight, @Nullable CancellationSignal signal) throws IOException {
+        final ParcelFileDescriptor pfd = asset.getParcelFileDescriptor();
+        final long offset = asset.getStartOffset();
+        final long length = asset.getDeclaredLength();
+        final StructStat st;
         try {
-            writer.join(1000);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+            st = Os.fstat(pfd.getFileDescriptor());
+        } catch (ErrnoException e) {
+            throw new IOException("asset not readable", e);
         }
-        if (tooLong[0]) {
-            bitmap.recycle();
-            throw new VmDecodeRejectedException("stream longer than " + IDecodeService.MAX_INPUT_BYTES);
+        final boolean regular = OsConstants.S_ISREG(st.st_mode);
+        if (!regular || (offset == 0 && (length < 0 || length == st.st_size))) {
+            if (!regular && offset != 0) {
+                throw new VmDecodeRejectedException("offset into a stream");
+            }
+            return decode(pfd, owner, priority, null, maxWidth, maxHeight, signal);
         }
-        return bitmap;
+        if (length < 0 || length > IDecodeService.MAX_INPUT_BYTES || offset < 0) {
+            throw new VmDecodeRejectedException("asset part out of range");
+        }
+        try (ParcelFileDescriptor part = copyToMemory(pfd.getFileDescriptor(), offset, (int) length)) {
+            return decode(part, owner, priority, null, maxWidth, maxHeight, signal);
+        }
     }
 
     /** The checked metadata record of an image. */
@@ -253,7 +318,7 @@ public final class VmDecode {
                 final MetadataRecord reply = service.readMetadata(request);
                 checkStatus(reply == null ? -1 : reply.status);
                 try {
-                    return Metadata.check(reply);
+                    return Metadata.check(reply, System.currentTimeMillis());
                 } catch (StripeValidator.BadReplyException e) {
                     throw new VmDecodeRejectedException("bad metadata reply: " + e.getMessage());
                 }
@@ -281,16 +346,13 @@ public final class VmDecode {
         public final String originalDocumentId;
         public final int specialFormat;
 
-        private Metadata(MetadataRecord r) throws StripeValidator.BadReplyException {
+        private Metadata(MetadataRecord r, long nowMillis) throws StripeValidator.BadReplyException {
             StripeValidator.checkInfo(r.format, r.width, r.height);
             format = r.format;
             width = r.width;
             height = r.height;
             orientation = StripeValidator.checkOrientation(r.orientation);
-            if (r.dateTakenMillis < -1) {
-                throw new StripeValidator.BadReplyException("bad date");
-            }
-            dateTakenMillis = r.dateTakenMillis;
+            dateTakenMillis = StripeValidator.checkDateTaken(r.dateTakenMillis, r.offsetKnown, nowMillis);
             offsetKnown = r.offsetKnown;
             StripeValidator.checkLocation(r.latitude, r.longitude);
             latitude = r.latitude;
@@ -309,27 +371,65 @@ public final class VmDecode {
             specialFormat = r.specialFormat;
         }
 
-        static Metadata check(MetadataRecord r) throws StripeValidator.BadReplyException {
-            return new Metadata(r);
+        static Metadata check(MetadataRecord r, long nowMillis) throws StripeValidator.BadReplyException {
+            return new Metadata(r, nowMillis);
         }
     }
 
+    /** Bytes already in memory, such as an embedded picture, as a memory file: no thread, nothing to block on. */
     private static Bitmap decodeBytes(byte[] bytes, @Nullable String owner, Size size,
             @Nullable CancellationSignal signal) throws IOException {
         if (bytes.length > IDecodeService.MAX_INPUT_BYTES) {
             throw new VmDecodeRejectedException("picture too large: " + bytes.length);
         }
-        final ParcelFileDescriptor[] pipe = ParcelFileDescriptor.createPipe();
-        final Thread writer = new Thread(() -> {
-            try (FileOutputStream out = new ParcelFileDescriptor.AutoCloseOutputStream(pipe[1])) {
-                out.write(bytes);
-            } catch (IOException e) {
-                // The service stopped reading: its reply says what happened.
+        try (ParcelFileDescriptor memory = memoryFile(bytes, bytes.length)) {
+            return decode(memory, owner, PRIORITY_USER_WAITING, null, size.getWidth(), size.getHeight(), signal);
+        }
+    }
+
+    /** A part of a regular file copied into a memory file, with pread and a deadline for the whole copy. */
+    private static ParcelFileDescriptor copyToMemory(FileDescriptor source, long offset, int length)
+            throws IOException {
+        final byte[] buffer = new byte[length];
+        final long deadline = System.currentTimeMillis() + COPY_DEADLINE_MILLIS;
+        int done = 0;
+        try {
+            while (done < length) {
+                if (System.currentTimeMillis() > deadline) {
+                    throw new VmDecodeRejectedException("asset copy too slow");
+                }
+                final int n = Os.pread(source, buffer, done, Math.min(65536, length - done), offset + done);
+                if (n <= 0) {
+                    throw new VmDecodeRejectedException("asset shorter than declared");
+                }
+                done += n;
             }
-        }, "VmDecodeBytes");
-        writer.start();
-        try (ParcelFileDescriptor read = pipe[0]) {
-            return decode(read, owner, PRIORITY_USER_WAITING, null, size.getWidth(), size.getHeight(), signal);
+        } catch (ErrnoException e) {
+            throw new IOException("asset not readable", e);
+        }
+        return memoryFile(buffer, length);
+    }
+
+    private static ParcelFileDescriptor memoryFile(byte[] bytes, int length) throws IOException {
+        FileDescriptor fd = null;
+        try {
+            fd = Os.memfd_create("vmdecode", OsConstants.MFD_CLOEXEC);
+            int done = 0;
+            while (done < length) {
+                done += Os.write(fd, bytes, done, length - done);
+            }
+            Os.lseek(fd, 0, OsConstants.SEEK_SET);
+            return ParcelFileDescriptor.dup(fd);
+        } catch (ErrnoException e) {
+            throw new IOException("memory file", e);
+        } finally {
+            if (fd != null) {
+                try {
+                    Os.close(fd);
+                } catch (ErrnoException ignored) {
+                    // Nothing to do.
+                }
+            }
         }
     }
 
@@ -415,7 +515,7 @@ public final class VmDecode {
         return MimeUtils.resolveMimeType(file);
     }
 
-    /** File identity for the probe cache: any write changes the change time, so a changed file is probed again. */
+    /** File identity for the probe caches: any write changes the change time, so a changed file is probed again. */
     private static String identity(File file) throws IOException {
         try {
             final StructStat st = Os.stat(file.getAbsolutePath());

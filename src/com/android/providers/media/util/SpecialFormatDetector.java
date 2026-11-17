@@ -74,9 +74,18 @@ public class SpecialFormatDetector {
      * {@return} special format for a file
      */
     public static int detect(File file) throws Exception {
+        return detect(file, null);
+    }
+
+    /**
+     * {@return} special format for a file whose bytes came from {@code owner}. Throws
+     * VmDecodeUnavailableException or VmDecodeRejectedException when the decode service gave no real answer: the
+     * caller stores nothing and asks again later.
+     */
+    public static int detect(File file, String owner) throws Exception {
         try (FileInputStream is = new FileInputStream(file)) {
             final ExifInterface exif = new ExifInterface(is);
-            return detect(exif, file);
+            return detect(exif, file, owner);
         }
     }
 
@@ -84,11 +93,18 @@ public class SpecialFormatDetector {
      * {@return} special format for a file
      */
     public static int detect(ExifInterface exif, File file) throws Exception {
+        return detect(exif, file, null);
+    }
+
+    /**
+     * {@return} special format for a file whose bytes came from {@code owner}
+     */
+    public static int detect(ExifInterface exif, File file, String owner) throws Exception {
         if (isMotionPhoto(exif)) {
             return FileColumns._SPECIAL_FORMAT_MOTION_PHOTO;
         }
 
-        return detectGifOrAnimatedWebp(file);
+        return detectGifOrAnimatedWebp(file, owner);
     }
 
     /**
@@ -100,16 +116,11 @@ public class SpecialFormatDetector {
      *         {@link FileColumns#_SPECIAL_FORMAT_ANIMATED_WEBP} if the file is an Animated Webp
      *         file. Otherwise returns {@link FileColumns#_SPECIAL_FORMAT_NONE}
      */
-    private static int detectGifOrAnimatedWebp(File file) throws IOException {
-        // The header is read in the decode service's VM, not here. Unavailable throws
-        // VmDecodeUnavailableException, and the caller leaves the value unset to try again later.
-        final VmDecode.Info info;
-        try {
-            info = VmDecode.probe(file, null, VmDecode.PRIORITY_BACKGROUND);
-        } catch (com.android.providers.media.vmdecode.VmDecodeRejectedException e) {
-            // Not an image the VM can read: no special format, as before for undecodable files.
-            return FileColumns._SPECIAL_FORMAT_NONE;
-        }
+    private static int detectGifOrAnimatedWebp(File file, String owner) throws IOException {
+        // The header is read in the decode service's VM, not here. Only a real answer is returned: unavailable or
+        // unreadable throws, and the caller leaves the value unset to try again later, so a format the VM learns
+        // later still gets its answer.
+        final VmDecode.Info info = VmDecode.probe(file, owner, VmDecode.PRIORITY_BACKGROUND);
 
         if (info.isGif()) {
             return FileColumns._SPECIAL_FORMAT_GIF;

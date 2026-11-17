@@ -30,6 +30,16 @@ public final class StripeValidator {
     public static final int MAX_NUMBER_CHARS = 32;
     public static final int MAX_ID_CHARS = 128;
     public static final int MAX_FORMAT = 10;
+    // The same values as IDecodeService.FORMAT_*.
+    static final int FORMAT_PNG = 2;
+    static final int FORMAT_GIF = 3;
+    static final int FORMAT_WEBP = 4;
+    static final int FORMAT_HEIF = 6;
+    static final int FORMAT_AVIF = 7;
+    /** Date taken: 1900-01-01 to 9999-12-31 UTC, one day of slack each way, and never more than a day ahead. */
+    static final long MIN_DATE_MILLIS = -2208988800000L - 86400000L;
+    static final long MAX_DATE_MILLIS = 253402300799999L + 86400000L;
+    static final long DAY_MILLIS = 86400000L;
 
     private StripeValidator() {
     }
@@ -107,7 +117,16 @@ public final class StripeValidator {
         }
     }
 
-    /** Checks a probe result. */
+    /** Checks a probe result, the animation flag included: only GIF, WebP, PNG (APNG), HEIF and AVIF animate. */
+    public static void checkInfo(int format, int width, int height, boolean animated) throws BadReplyException {
+        checkInfo(format, width, height);
+        if (animated && format != FORMAT_GIF && format != FORMAT_WEBP && format != FORMAT_PNG
+                && format != FORMAT_HEIF && format != FORMAT_AVIF) {
+            throw new BadReplyException("animated flag on format " + format);
+        }
+    }
+
+    /** Checks a format and size. */
     public static void checkInfo(int format, int width, int height) throws BadReplyException {
         if (format < 0 || format > MAX_FORMAT) {
             throw new BadReplyException("bad format " + format);
@@ -118,8 +137,10 @@ public final class StripeValidator {
     }
 
     /**
-     * Free text: at most {@code max} characters, no control characters (C0, DEL, C1), no bidi controls, no unpaired
-     * surrogates. Null and empty stay empty.
+     * Free text: at most {@code max} characters. No control characters (C0, DEL, C1), no line or paragraph
+     * separators (U+2028, U+2029), no bidi controls (U+061C, U+200E, U+200F, U+202A to U+202E, U+2066 to U+2069), no
+     * zero-width characters (U+180E, U+200B to U+200D, U+2060, U+FEFF), no unpaired surrogates. Null and empty stay
+     * empty.
      */
     public static String checkText(String text, int max) throws BadReplyException {
         if (text == null || text.isEmpty()) {
@@ -130,9 +151,11 @@ public final class StripeValidator {
         }
         for (int i = 0; i < text.length(); i++) {
             final char c = text.charAt(i);
-            if (c < 0x20 || (c >= 0x7f && c <= 0x9f) || (c >= 0x200e && c <= 0x200f)
-                    || (c >= 0x202a && c <= 0x202e) || (c >= 0x2066 && c <= 0x2069) || c == 0xfeff) {
-                throw new BadReplyException("control character in text at " + i);
+            if (c < 0x20 || (c >= 0x7f && c <= 0x9f) || c == 0x061c || c == 0x180e
+                    || (c >= 0x200b && c <= 0x200f) || c == 0x2028 || c == 0x2029
+                    || (c >= 0x202a && c <= 0x202e) || c == 0x2060 || (c >= 0x2066 && c <= 0x2069)
+                    || c == 0xfeff) {
+                throw new BadReplyException("control or invisible character in text at " + i);
             }
             if (Character.isHighSurrogate(c)) {
                 if (i + 1 >= text.length() || !Character.isLowSurrogate(text.charAt(i + 1))) {
@@ -170,6 +193,23 @@ public final class StripeValidator {
             }
         }
         return text;
+    }
+
+    /**
+     * Date taken in UTC milliseconds: -1 for none (then the offset cannot be known), otherwise within
+     * [MIN_DATE_MILLIS, MAX_DATE_MILLIS] and at most a day after {@code nowMillis}.
+     */
+    public static long checkDateTaken(long millis, boolean offsetKnown, long nowMillis) throws BadReplyException {
+        if (millis == -1) {
+            if (offsetKnown) {
+                throw new BadReplyException("offset without a date");
+            }
+            return millis;
+        }
+        if (millis < MIN_DATE_MILLIS || millis > MAX_DATE_MILLIS || millis > nowMillis + DAY_MILLIS) {
+            throw new BadReplyException("bad date " + millis);
+        }
+        return millis;
     }
 
     /** Orientation: 0, 90, 180, 270, or -1 for none. */

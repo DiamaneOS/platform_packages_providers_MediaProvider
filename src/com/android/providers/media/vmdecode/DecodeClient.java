@@ -52,12 +52,18 @@ final class DecodeClient {
 
     private static final long CONNECT_TIMEOUT_USER_WAITING_MS = 3_000;
     private static final long CONNECT_TIMEOUT_BACKGROUND_MS = 15_000;
-    private static final long CALL_TIMEOUT_USER_WAITING_MS = 15_000;
-    private static final long CALL_TIMEOUT_BACKGROUND_MS = 60_000;
+    // A little longer than the service's own budgets (20 s and 60 s, queue included), so a miss here means the service
+    // broke its deadline.
+    private static final long CALL_TIMEOUT_USER_WAITING_MS = 25_000;
+    private static final long CALL_TIMEOUT_BACKGROUND_MS = 75_000;
 
-    // A call stuck past its deadline keeps its thread until the service answers or the binder dies. Few threads, so a
-    // stuck service makes calls fail fast instead of piling threads up.
-    private static final int MAX_THREADS = 4;
+    // Two lanes with their own threads and queues, so background work (scans, idle maintenance) can never take the
+    // capacity of requests the user waits on. A call stuck past its deadline keeps its thread until the service
+    // answers or the binder dies: few threads, so a stuck service makes calls fail fast instead of piling threads up.
+    private static final int USER_WAITING_THREADS = 4;
+    private static final int USER_WAITING_QUEUE = 32;
+    private static final int BACKGROUND_THREADS = 2;
+    private static final int BACKGROUND_QUEUE = 64;
 
     /** One call to the service. */
     interface Call<T> {
@@ -65,9 +71,8 @@ final class DecodeClient {
     }
 
     private final Context mContext;
-    private final ThreadPoolExecutor mExecutor = new ThreadPoolExecutor(MAX_THREADS, MAX_THREADS, 30,
-            TimeUnit.SECONDS, new LinkedBlockingQueue<>(64),
-            new ThreadPoolExecutor.AbortPolicy());
+    private final ThreadPoolExecutor mUserWaiting = lane(USER_WAITING_THREADS, USER_WAITING_QUEUE);
+    private final ThreadPoolExecutor mBackground = lane(BACKGROUND_THREADS, BACKGROUND_QUEUE);
 
     private final Object mLock = new Object();
     @GuardedBy("mLock")
@@ -104,7 +109,13 @@ final class DecodeClient {
 
     DecodeClient(@NonNull Context context) {
         mContext = context.getApplicationContext();
-        mExecutor.allowCoreThreadTimeOut(true);
+    }
+
+    private static ThreadPoolExecutor lane(int threads, int queue) {
+        final ThreadPoolExecutor executor = new ThreadPoolExecutor(threads, threads, 30, TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(queue), new ThreadPoolExecutor.AbortPolicy());
+        executor.allowCoreThreadTimeOut(true);
+        return executor;
     }
 
     /** Runs {@code call} against the service within the deadline for {@code priority}. */
@@ -115,7 +126,7 @@ final class DecodeClient {
                 : CONNECT_TIMEOUT_BACKGROUND_MS);
         final Future<T> future;
         try {
-            future = mExecutor.submit(() -> call.run(service));
+            future = (waiting ? mUserWaiting : mBackground).submit(() -> call.run(service));
         } catch (RuntimeException e) {
             throw new VmDecodeUnavailableException("decode calls are all busy", e);
         }
