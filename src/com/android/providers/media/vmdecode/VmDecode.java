@@ -27,6 +27,7 @@ import android.os.CancellationSignal;
 import android.os.Environment;
 import android.os.ParcelFileDescriptor;
 import android.os.RemoteException;
+import android.os.SystemClock;
 import android.system.ErrnoException;
 import android.system.Os;
 import android.system.OsConstants;
@@ -77,11 +78,23 @@ public final class VmDecode {
     private static final Object sLock = new Object();
     private static DecodeClient sClient;
 
-    // Probe answers by file identity (device, inode, size, both change times). Rejections are kept too, for this
-    // process's life, so an undecodable file is not sent again and again until it changes. The service keeps its own
-    // cache by content hash, since it reads the bytes anyway, and here a stat is enough.
+    // Probe answers by file identity (device, inode, size, both change times). The service's verdicts on a file
+    // (invalid, unsupported, a reply that broke the contract) are kept for REJECTED_MILLIS, so an undecodable file
+    // is not sent again and again until it changes. Read problems (a slow or stalling source) are not kept. The
+    // service keeps its own cache by content hash, since it reads the bytes anyway, and here a stat is enough.
+    private static final long REJECTED_MILLIS = 60 * 60 * 1000;
     private static final LruCache<String, Info> sProbeCache = new LruCache<>(512);
-    private static final LruCache<String, String> sRejectedCache = new LruCache<>(512);
+    private static final LruCache<String, Rejected> sRejectedCache = new LruCache<>(512);
+
+    private static final class Rejected {
+        final String message;
+        final long until;
+
+        Rejected(String message, long until) {
+            this.message = message;
+            this.until = until;
+        }
+    }
 
     private VmDecode() {
     }
@@ -139,9 +152,12 @@ public final class VmDecode {
         if (cached != null) {
             return cached;
         }
-        final String rejected = sRejectedCache.get(key);
+        final Rejected rejected = sRejectedCache.get(key);
         if (rejected != null) {
-            throw new VmDecodeRejectedException(rejected);
+            if (SystemClock.elapsedRealtime() < rejected.until) {
+                throw new VmDecodeRejectedException(rejected.message, true);
+            }
+            sRejectedCache.remove(key);
         }
         try (ParcelFileDescriptor opened = ParcelFileDescriptor.open(file,
                 ParcelFileDescriptor.MODE_READ_ONLY);
@@ -156,7 +172,10 @@ public final class VmDecode {
             sProbeCache.put(key, info);
             return info;
         } catch (VmDecodeRejectedException e) {
-            sRejectedCache.put(key, e.getMessage() == null ? "rejected" : e.getMessage());
+            if (e.verdict) {
+                sRejectedCache.put(key, new Rejected(e.getMessage() == null ? "rejected" : e.getMessage(),
+                        SystemClock.elapsedRealtime() + REJECTED_MILLIS));
+            }
             throw e;
         }
     }
@@ -328,6 +347,9 @@ public final class VmDecode {
             final DecodeRequest request = request(pfd, owner, priority, mimeOf(file));
             return client().call(priority, owner, service -> {
                 final MetadataRecord reply = service.readMetadata(request);
+                if (reply != null) {
+                    DecodeChecks.dropFutureDate(reply, System.currentTimeMillis());
+                }
                 checkReply(reply == null, DecodeChecks.check(reply, System.currentTimeMillis()));
                 checkStatus(reply.status);
                 return new Metadata(reply);
@@ -471,7 +493,7 @@ public final class VmDecode {
                     final byte[] stripe = service.readStripe(reply.handle, i);
                     final String bad = DecodeChecks.check(reply, i, stripe);
                     if (bad != null) {
-                        throw new VmDecodeRejectedException("bad stripe " + i + ": " + bad);
+                        throw new VmDecodeRejectedException("bad stripe " + i + ": " + bad, true);
                     }
                     System.arraycopy(stripe, 0, frame, i * reply.stripeRows * rowBytes, stripe.length);
                 }
@@ -498,7 +520,7 @@ public final class VmDecode {
             throw new RemoteException("no reply");
         }
         if (bad != null) {
-            throw new VmDecodeRejectedException("reply broke the contract: " + bad);
+            throw new VmDecodeRejectedException("reply broke the contract: " + bad, true);
         }
     }
 
@@ -510,11 +532,11 @@ public final class VmDecode {
             case IDecodeService.STATUS_UNAVAILABLE:
                 throw new RemoteException("decode service unavailable");
             case IDecodeService.STATUS_UNSUPPORTED:
-                throw new VmDecodeRejectedException("unsupported format");
+                throw new VmDecodeRejectedException("unsupported format", true);
             case IDecodeService.STATUS_INVALID:
-                throw new VmDecodeRejectedException("invalid file");
+                throw new VmDecodeRejectedException("invalid file", true);
             default:
-                throw new VmDecodeRejectedException("bad status " + status);
+                throw new VmDecodeRejectedException("bad status " + status, true);
         }
     }
 

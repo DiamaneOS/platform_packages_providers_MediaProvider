@@ -19,11 +19,20 @@ package com.android.providers.media.vmdecode;
 import java.io.IOException;
 
 /**
- * The file cannot be decoded: an unsupported format, a broken or hostile file, or a reply that broke the contract.
- * Treated like a file that has no thumbnail. Asking again would give the same answer.
+ * The file cannot be decoded: an unsupported format, a broken or hostile file, a reply that broke the contract, or a
+ * source that could not be read in time. Treated like a file that has no thumbnail. Only the VM's own verdicts
+ * ({@link #verdict}) give the same answer when asked again. A read problem may pass.
  */
 public class VmDecodeRejectedException extends IOException {
+    /** The decode service's verdict on the file (invalid, unsupported, or a reply that broke the contract). */
+    public final boolean verdict;
+
     public VmDecodeRejectedException(String message) {
+        this(message, false);
+    }
+
+    public VmDecodeRejectedException(String message, boolean verdict) {
         super(message);
+        this.verdict = verdict;
     }
 }

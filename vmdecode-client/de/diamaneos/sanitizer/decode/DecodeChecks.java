@@ -90,6 +90,19 @@ public final class DecodeChecks {
         return null;
     }
 
+    /**
+     * A date taken in the future (more than a day ahead of this phone's clock) is not believed: the date and its
+     * offset are dropped and the rest of the record stays. A camera with a wrong clock, or this phone's own clock
+     * behind, gives such dates, so it is not a reason to refuse the record. Call before check.
+     */
+    public static void dropFutureDate(MetadataRecord m, long nowMillis) {
+        if (m != null && m.dateTakenMillis != -1 && m.dateTakenMillis > nowMillis + DAY) {
+            m.dateTakenMillis = -1;
+            m.offsetKnown = false;
+        }
+    }
+
+    /** The record's rules. A date in the future is not checked here (dropFutureDate), only its range. */
     public static String check(MetadataRecord m, long nowMillis) {
         if (m == null || !status(m.status)) return "status";
         if (m.status != IDecodeService.STATUS_OK) return null;
@@ -101,8 +114,7 @@ public final class DecodeChecks {
         }
         if (m.dateTakenMillis == -1) {
             if (m.offsetKnown) return "offset without date";
-        } else if (m.dateTakenMillis < MIN_DATE || m.dateTakenMillis > MAX_DATE
-                || m.dateTakenMillis > nowMillis + DAY) {
+        } else if (m.dateTakenMillis < MIN_DATE || m.dateTakenMillis > MAX_DATE) {
             return "date";
         }
         boolean noLat = Double.isNaN(m.latitude), noLon = Double.isNaN(m.longitude);
