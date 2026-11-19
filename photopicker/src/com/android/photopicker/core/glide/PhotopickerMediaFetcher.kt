@@ -83,9 +83,12 @@ class PhotopickerMediaFetcher(
                     putString(EXTRA_PICKER_IMAGE_MIME, model.getMimeTypeForGlide())
                     putParcelable(EXTRA_PICKER_IMAGE_OUT, pipe[1])
                 }
-            // Returns at once: MediaProvider writes the image, or closes the pipe with an error.
+            // The MediaProvider of the item's user (content://<user>@<authority>/...), which accepts only
+            // items of its own user. Returns at once: it writes the image, or closes the pipe with an error.
+            val uri = model.getLoadableUri()
+            val authority = uri.userInfo?.let { "$it@${MediaStore.AUTHORITY}" } ?: MediaStore.AUTHORITY
             resolver.call(
-                MediaStore.AUTHORITY,
+                authority,
                 PICKER_IMAGE_CALL,
                 model.getLoadableUri().toString(),
                 extras,

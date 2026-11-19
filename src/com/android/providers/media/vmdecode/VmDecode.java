@@ -358,7 +358,9 @@ public final class VmDecode {
      */
     public static @Nullable String pickerOwner(@NonNull Context context, @NonNull Uri uri) {
         try {
-            final String authority = uri.getAuthority();
+            // The picker's URIs carry the user before the host (content://0@authority/...): the host alone names
+            // the provider.
+            final String authority = uri.getHost();
             if (PickerSyncController.LOCAL_PICKER_PROVIDER_AUTHORITY.equals(authority)) {
                 final String id = uri.getLastPathSegment();
                 final Uri item = MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL, Long.parseLong(id));
@@ -402,6 +404,7 @@ public final class VmDecode {
         if (uriString == null || extras == null) {
             throw new IllegalArgumentException("no item");
         }
+        checkPickerUri(context, Uri.parse(uriString), Binder.getCallingPid(), Binder.getCallingUid());
         final ParcelFileDescriptor out = extras.getParcelable(EXTRA_PICKER_IMAGE_OUT);
         if (out == null) {
             throw new IllegalArgumentException("no pipe");
@@ -426,14 +429,100 @@ public final class VmDecode {
         return new Bundle();
     }
 
+    /**
+     * Only a picker item the calling picker may itself read: a content URI of the local picker provider or of the
+     * current cloud media provider, in this MediaProvider's user, of the form {@code /media/<id>}, with the caller's
+     * own read access checked as its own open would check it. MediaProvider opens the item with its own identity
+     * afterwards, so nothing else may pass here.
+     */
+    static void checkPickerUri(Context context, Uri uri, int pid, int uid) {
+        final String host = uri.getHost();
+        final String user = uri.getUserInfo();
+        final java.util.List<String> path = uri.getPathSegments();
+        String cloud = null;
+        try {
+            cloud = PickerSyncController.getInstanceOrThrow().getCloudProvider();
+        } catch (IllegalStateException e) {
+            // No picker data layer: only the local provider.
+        }
+        final boolean provider = PickerSyncController.LOCAL_PICKER_PROVIDER_AUTHORITY.equals(host)
+                || (cloud != null && cloud.equals(host));
+        final boolean sameUser = user == null
+                || user.equals(String.valueOf(android.os.UserHandle.myUserId()));
+        if (!ContentResolver.SCHEME_CONTENT.equals(uri.getScheme()) || !provider || !sameUser
+                || path.size() != 2 || !"media".equals(path.get(0)) || uri.getQuery() != null
+                || uri.getFragment() != null
+                || context.checkUriPermission(uri, pid, uid, android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            throw new SecurityException("not a picker item the caller may read");
+        }
+    }
+
+    // A picker that stops reading cannot hold a thread: each write waits at most this long.
+    private static final int PICKER_WRITE_MILLIS = 10_000;
+
+    private static boolean readerGone(ParcelFileDescriptor out) {
+        try {
+            final android.system.StructPollfd p = new android.system.StructPollfd();
+            p.fd = out.getFileDescriptor();
+            p.events = 0;
+            return Os.poll(new android.system.StructPollfd[] {p}, 0) > 0
+                    && (p.revents & (OsConstants.POLLERR | OsConstants.POLLHUP)) != 0;
+        } catch (ErrnoException e) {
+            return true;
+        }
+    }
+
+    private static void writeWithDeadline(ParcelFileDescriptor out, byte[] bytes, int length) throws IOException {
+        final FileDescriptor fd = out.getFileDescriptor();
+        try {
+            Os.fcntlInt(fd, OsConstants.F_SETFL, Os.fcntlInt(fd, OsConstants.F_GETFL, 0) | OsConstants.O_NONBLOCK);
+            int done = 0;
+            final long deadline = SystemClock.elapsedRealtime() + PICKER_WRITE_MILLIS;
+            while (done < length) {
+                final long left = deadline - SystemClock.elapsedRealtime();
+                if (left <= 0) {
+                    throw new IOException("picker stopped reading");
+                }
+                final android.system.StructPollfd p = new android.system.StructPollfd();
+                p.fd = fd;
+                p.events = (short) OsConstants.POLLOUT;
+                if (Os.poll(new android.system.StructPollfd[] {p}, (int) left) <= 0) {
+                    continue;
+                }
+                if ((p.revents & (OsConstants.POLLERR | OsConstants.POLLHUP)) != 0) {
+                    throw new IOException("picker closed its end");
+                }
+                try {
+                    done += Os.write(fd, bytes, done, Math.min(65536, length - done));
+                } catch (ErrnoException e) {
+                    if (e.errno != OsConstants.EAGAIN) {
+                        throw e;
+                    }
+                }
+            }
+        } catch (ErrnoException e) {
+            throw new IOException("picker pipe", e);
+        }
+    }
+
     private static void writePickerImage(Context context, Uri uri, String mime, Bundle opts, @Nullable Point size,
             ParcelFileDescriptor out) {
-        // MediaProvider's own identity opens the item, as for the picker inside MediaProvider.
-        final long token = Binder.clearCallingIdentity();
+        // MediaProvider's own identity opens the item, checked against the picker's own access (checkPickerUri).
         final CancellationSignal signal = new CancellationSignal();
+        boolean written = false;
+        // A cell that scrolled away closed its end: no decode for it.
+        if (readerGone(out)) {
+            closeWithError(out, "gone");
+            return;
+        }
         try (AssetFileDescriptor asset = context.getContentResolver().openTypedAssetFile(uri, mime, opts, signal)) {
             if (asset == null) {
                 closeWithError(out, "no data");
+                return;
+            }
+            if (readerGone(out)) {
+                closeWithError(out, "gone");
                 return;
             }
             final DisplayMetrics metrics = context.getResources().getDisplayMetrics();
@@ -445,22 +534,29 @@ public final class VmDecode {
             final ByteArrayOutputStream png = new ByteArrayOutputStream();
             bitmap.compress(Bitmap.CompressFormat.PNG, 100, png);
             bitmap.recycle();
-            try (ParcelFileDescriptor.AutoCloseOutputStream stream =
-                    new ParcelFileDescriptor.AutoCloseOutputStream(out)) {
-                png.writeTo(stream);
-            }
-        } catch (IOException | RuntimeException e) {
-            Log.w(TAG, "picker image: " + e);
-            closeWithError(out, "not decoded");
+            final byte[] bytes = png.toByteArray();
+            writeWithDeadline(out, bytes, bytes.length);
+            written = true;
+        } catch (Throwable t) {
+            // Out of memory included: the thread carries on, and the picker's read always ends.
+            Log.w(TAG, "picker image: " + t);
         } finally {
-            Binder.restoreCallingIdentity(token);
+            if (written) {
+                try {
+                    out.close();
+                } catch (IOException ignored) {
+                    // The picker gave up.
+                }
+            } else {
+                closeWithError(out, "not decoded");
+            }
         }
     }
 
     private static void closeWithError(ParcelFileDescriptor out, String why) {
         try {
             out.closeWithError(why);
-        } catch (IOException ignored) {
+        } catch (IOException | RuntimeException ignored) {
             // Closed already: the picker gave up.
         }
     }
