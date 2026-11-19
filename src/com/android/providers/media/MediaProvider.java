@@ -8011,6 +8011,13 @@ public class MediaProvider extends ContentProvider {
             case MediaStore.GET_CLOUD_PROVIDER_LABEL_CALL: {
                 return getResultForGetCloudProviderLabel();
             }
+            case VmDecode.PICKER_IMAGE_CALL: {
+                // DiamaneOS: the photo picker app's images, decoded in the decode service's VM.
+                if (!isCallerPhotoPicker()) {
+                    throw new SecurityException(getSecurityExceptionMessage("PICKER_IMAGE_CALL"));
+                }
+                return VmDecode.pickerImage(getContext(), arg, extras);
+            }
             case MediaStore.GET_CLOUD_PROVIDER_DETAILS: {
                 if (isCallerPhotoPicker()) {
                     return PickerDataLayerV2.getCloudProviderDetails(extras);

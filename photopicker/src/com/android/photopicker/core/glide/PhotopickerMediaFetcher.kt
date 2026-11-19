@@ -17,11 +17,11 @@
 package com.android.photopicker.core.glide
 
 import android.content.ContentResolver
-import android.content.res.AssetFileDescriptor
 import android.graphics.Point
 import android.os.Bundle
-import android.os.CancellationSignal
+import android.os.ParcelFileDescriptor
 import android.provider.CloudMediaProviderContract
+import android.provider.MediaStore
 import android.util.Log
 import com.bumptech.glide.Priority
 import com.bumptech.glide.load.DataSource
@@ -54,52 +54,54 @@ class PhotopickerMediaFetcher(
 
     companion object {
         val TAG: String = "PhotopickerMediaFetcher"
+
+        // DiamaneOS: MediaProvider decodes the picker's images in the decode service's protected VM
+        // and writes a PNG of the checked pixels into a pipe, so Glide here only ever decodes that PNG,
+        // never an item's own bytes. The names are MediaProvider's (vmdecode/VmDecode.java).
+        const val PICKER_IMAGE_CALL = "de.diamaneos.vmdecode.picker_image"
+        const val EXTRA_PICKER_IMAGE_OUT = "de.diamaneos.vmdecode.picker_image_out"
+        const val EXTRA_PICKER_IMAGE_MIME = "de.diamaneos.vmdecode.picker_image_mime"
     }
 
-    private val cancellationSignal = CancellationSignal()
-
-    // Retain a reference to loaded resources this worker opens. These need to be held open for
-    // Glide
-    // and will be closed during [cleanup].
-    private var afd: AssetFileDescriptor? = null
-    private var inputStream: InputStream? = null
+    // The read end of the pipe MediaProvider writes the image into, held open for Glide and closed
+    // during [cleanup] or [cancel].
+    @Volatile private var inputStream: InputStream? = null
 
     /**
      * The load request that is issued by Glide so this worker can begin to load it's data. The
      * callback should be used to notify Glide of the outcome.
      */
     override fun loadData(priority: Priority, callback: DataCallback<in InputStream>) {
-        val options =
-            Bundle().apply {
-                putParcelable(ContentResolver.EXTRA_SIZE, Point(width, height))
-
-                // Force the CloudProvider to return an image, even for videos.
-                putBoolean(CloudMediaProviderContract.EXTRA_PREVIEW_THUMBNAIL, true)
-
-                if (options.get(RESOLUTION_REQUESTED)?.equals(Resolution.THUMBNAIL) ?: false) {
-                    putBoolean(CloudMediaProviderContract.EXTRA_MEDIASTORE_THUMB, true)
-                }
-            }
-
+        val pipe = ParcelFileDescriptor.createReliablePipe()
         try {
-            afd =
-                resolver.openTypedAssetFile(
-                    /* uri= */ model.getLoadableUri(),
-                    /* mimeType=*/ model.getMimeTypeForGlide(),
-                    /* opts= */ options,
-                    /* signal= */ cancellationSignal,
-                )
-            if (afd == null) {
-                callback.onLoadFailed(
-                    FileNotFoundException("Failed to load data for ${model.getLoadableUri()}")
-                )
-                return
-            }
-            inputStream = afd?.createInputStream()
-            callback.onDataReady(inputStream)
-        } catch (ex: IOException) {
-            callback.onLoadFailed(ex)
+            val extras =
+                Bundle().apply {
+                    putParcelable(ContentResolver.EXTRA_SIZE, Point(width, height))
+                    if (options.get(RESOLUTION_REQUESTED)?.equals(Resolution.THUMBNAIL) ?: false) {
+                        putBoolean(CloudMediaProviderContract.EXTRA_MEDIASTORE_THUMB, true)
+                    }
+                    putString(EXTRA_PICKER_IMAGE_MIME, model.getMimeTypeForGlide())
+                    putParcelable(EXTRA_PICKER_IMAGE_OUT, pipe[1])
+                }
+            // Returns at once: MediaProvider writes the image, or closes the pipe with an error.
+            resolver.call(
+                MediaStore.AUTHORITY,
+                PICKER_IMAGE_CALL,
+                model.getLoadableUri().toString(),
+                extras,
+            )
+        } catch (ex: RuntimeException) {
+            pipe[0].close()
+            callback.onLoadFailed(
+                FileNotFoundException("Failed to load data for ${model.getLoadableUri()}: $ex")
+            )
+            return
+        } finally {
+            pipe[1].close()
         }
+        val stream = ParcelFileDescriptor.AutoCloseInputStream(pipe[0])
+        inputStream = stream
+        callback.onDataReady(stream)
     }
 
     /**
@@ -109,7 +111,6 @@ class PhotopickerMediaFetcher(
     override fun cleanup() {
         try {
             inputStream?.close()
-            afd?.close()
         } catch (ex: IOException) {
             Log.d(TAG, "Unexpected error during media fetcher cleanup", ex)
         }
@@ -120,7 +121,12 @@ class PhotopickerMediaFetcher(
      * cancellation here. (Maybe the image is no longer in view, etc..)
      */
     override fun cancel() {
-        cancellationSignal.cancel()
+        // MediaProvider's write then fails and it stops.
+        try {
+            inputStream?.close()
+        } catch (ex: IOException) {
+            Log.d(TAG, "Unexpected error during media fetcher cancel", ex)
+        }
     }
 
     override fun getDataClass(): Class<InputStream> {

@@ -18,20 +18,28 @@ package com.android.providers.media.vmdecode;
 
 import android.content.ContentResolver;
 import android.content.Context;
+import android.content.pm.ProviderInfo;
 import android.content.res.AssetFileDescriptor;
+import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.graphics.Matrix;
+import android.graphics.Point;
 import android.media.MediaMetadataRetriever;
 import android.net.Uri;
+import android.os.Binder;
+import android.os.Bundle;
 import android.os.CancellationSignal;
 import android.os.Environment;
 import android.os.ParcelFileDescriptor;
 import android.os.RemoteException;
 import android.os.SystemClock;
+import android.provider.CloudMediaProviderContract;
+import android.provider.MediaStore;
 import android.system.ErrnoException;
 import android.system.Os;
 import android.system.OsConstants;
 import android.system.StructStat;
+import android.util.DisplayMetrics;
 import android.util.Log;
 import android.util.LruCache;
 import android.util.Size;
@@ -39,6 +47,7 @@ import android.util.Size;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
+import com.android.providers.media.photopicker.PickerSyncController;
 import com.android.providers.media.util.MimeUtils;
 
 import de.diamaneos.sanitizer.decode.DecodeChecks;
@@ -48,6 +57,7 @@ import de.diamaneos.sanitizer.decode.ImageInfo;
 import de.diamaneos.sanitizer.decode.MetadataRecord;
 import de.diamaneos.sanitizer.decode.Thumbnail;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileDescriptor;
 import java.io.FileNotFoundException;
@@ -57,6 +67,10 @@ import java.util.Arrays;
 import java.util.Comparator;
 import java.util.Locale;
 import java.util.Objects;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.function.ToIntFunction;
 
 /**
@@ -335,6 +349,119 @@ public final class VmDecode {
         }
         try (ParcelFileDescriptor part = copyToMemory(pfd.getFileDescriptor(), offset, (int) length)) {
             return decode(part, owner, priority, null, maxWidth, maxHeight, signal);
+        }
+    }
+
+    /**
+     * The package that supplied a picker item's bytes, for the decode service's fair queue: the media item's owner for
+     * the local provider, the cloud media provider's package otherwise. Null when unknown.
+     */
+    public static @Nullable String pickerOwner(@NonNull Context context, @NonNull Uri uri) {
+        try {
+            final String authority = uri.getAuthority();
+            if (PickerSyncController.LOCAL_PICKER_PROVIDER_AUTHORITY.equals(authority)) {
+                final String id = uri.getLastPathSegment();
+                final Uri item = MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL, Long.parseLong(id));
+                try (Cursor c = context.getContentResolver().query(item,
+                        new String[] {MediaStore.MediaColumns.OWNER_PACKAGE_NAME}, null, null)) {
+                    return c != null && c.moveToFirst() ? c.getString(0) : null;
+                }
+            }
+            final ProviderInfo provider = context.getPackageManager().resolveContentProvider(authority, 0);
+            return provider != null ? provider.packageName : null;
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    // The photo picker app (com.android.photopicker) shows its images through MediaProvider: it calls
+    // PICKER_IMAGE_CALL with the item's URI, the extras of its own openTypedAssetFile and the write end of a pipe.
+    // MediaProvider opens the item, has it decoded in the VM and writes a PNG of the checked pixels into the pipe, so
+    // the picker's image loader only ever decodes a PNG made here. The names are copied in the picker
+    // (photopicker/src/com/android/photopicker/core/glide/PhotopickerMediaFetcher.kt).
+    public static final String PICKER_IMAGE_CALL = "de.diamaneos.vmdecode.picker_image";
+    public static final String EXTRA_PICKER_IMAGE_OUT = "de.diamaneos.vmdecode.picker_image_out";
+    public static final String EXTRA_PICKER_IMAGE_MIME = "de.diamaneos.vmdecode.picker_image_mime";
+    // A few at a time, the rest wait briefly: the picker shows a grid, and a load past these is refused (the picker
+    // retries when the cell comes back into view).
+    private static final ThreadPoolExecutor sPickerImages = new ThreadPoolExecutor(4, 4, 30, TimeUnit.SECONDS,
+            new ArrayBlockingQueue<>(64));
+
+    static {
+        sPickerImages.allowCoreThreadTimeOut(true);
+    }
+
+    /**
+     * Starts one image for the photo picker app (see {@link #PICKER_IMAGE_CALL}) and returns at once. The caller is
+     * checked by MediaProvider. The result goes into the pipe, an error closes it with that error. Never throws for a
+     * bad item: the pipe carries the failure.
+     */
+    @SuppressWarnings("deprecation") // Bundle.getParcelable(String): the module also runs before API 33
+    public static @NonNull Bundle pickerImage(@NonNull Context context, @Nullable String uriString,
+            @Nullable Bundle extras) {
+        if (uriString == null || extras == null) {
+            throw new IllegalArgumentException("no item");
+        }
+        final ParcelFileDescriptor out = extras.getParcelable(EXTRA_PICKER_IMAGE_OUT);
+        if (out == null) {
+            throw new IllegalArgumentException("no pipe");
+        }
+        final Uri uri = Uri.parse(uriString);
+        final String mime = extras.getString(EXTRA_PICKER_IMAGE_MIME, "image/*");
+        // Only the options a picker image takes, nothing else from the caller.
+        final Bundle opts = new Bundle();
+        final Point size = extras.getParcelable(ContentResolver.EXTRA_SIZE);
+        if (size != null) {
+            opts.putParcelable(ContentResolver.EXTRA_SIZE, size);
+        }
+        opts.putBoolean(CloudMediaProviderContract.EXTRA_PREVIEW_THUMBNAIL, true);
+        if (extras.getBoolean(CloudMediaProviderContract.EXTRA_MEDIASTORE_THUMB)) {
+            opts.putBoolean(CloudMediaProviderContract.EXTRA_MEDIASTORE_THUMB, true);
+        }
+        try {
+            sPickerImages.execute(() -> writePickerImage(context, uri, mime, opts, size, out));
+        } catch (RejectedExecutionException e) {
+            closeWithError(out, "busy");
+        }
+        return new Bundle();
+    }
+
+    private static void writePickerImage(Context context, Uri uri, String mime, Bundle opts, @Nullable Point size,
+            ParcelFileDescriptor out) {
+        // MediaProvider's own identity opens the item, as for the picker inside MediaProvider.
+        final long token = Binder.clearCallingIdentity();
+        final CancellationSignal signal = new CancellationSignal();
+        try (AssetFileDescriptor asset = context.getContentResolver().openTypedAssetFile(uri, mime, opts, signal)) {
+            if (asset == null) {
+                closeWithError(out, "no data");
+                return;
+            }
+            final DisplayMetrics metrics = context.getResources().getDisplayMetrics();
+            final int screen = Math.max(metrics.widthPixels, metrics.heightPixels);
+            final int maxWidth = size != null && size.x > 0 ? size.x : screen;
+            final int maxHeight = size != null && size.y > 0 ? size.y : screen;
+            final Bitmap bitmap = decodeAsset(asset, pickerOwner(context, uri), PRIORITY_USER_WAITING, maxWidth,
+                    maxHeight, signal);
+            final ByteArrayOutputStream png = new ByteArrayOutputStream();
+            bitmap.compress(Bitmap.CompressFormat.PNG, 100, png);
+            bitmap.recycle();
+            try (ParcelFileDescriptor.AutoCloseOutputStream stream =
+                    new ParcelFileDescriptor.AutoCloseOutputStream(out)) {
+                png.writeTo(stream);
+            }
+        } catch (IOException | RuntimeException e) {
+            Log.w(TAG, "picker image: " + e);
+            closeWithError(out, "not decoded");
+        } finally {
+            Binder.restoreCallingIdentity(token);
+        }
+    }
+
+    private static void closeWithError(ParcelFileDescriptor out, String why) {
+        try {
+            out.closeWithError(why);
+        } catch (IOException ignored) {
+            // Closed already: the picker gave up.
         }
     }
 

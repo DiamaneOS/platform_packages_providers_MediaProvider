@@ -19,6 +19,7 @@ package com.android.photopicker.core.glide
 import android.content.ContentProvider
 import android.content.ContentResolver
 import android.content.Context
+import android.content.pm.ApplicationInfo
 import android.content.res.Resources
 import android.graphics.Point
 import android.graphics.drawable.Drawable
@@ -76,6 +77,7 @@ import org.mockito.ArgumentMatchers.any
 import org.mockito.ArgumentMatchers.anyInt
 import org.mockito.Captor
 import org.mockito.Mock
+import org.mockito.Mockito.never
 import org.mockito.Mockito.verify
 import org.mockito.MockitoAnnotations
 
@@ -328,6 +330,9 @@ class LoadMediaTest {
         val icon = context.getDrawable(R.drawable.android)
         whenever(mockContext.getResources()).thenReturn(mockResources)
         whenever(mockResources.getDrawable(anyInt(), any())).thenReturn(icon)
+        // An icon of a package on the system image.
+        whenever(mockContext.getApplicationInfo())
+            .thenReturn(ApplicationInfo().apply { flags = ApplicationInfo.FLAG_SYSTEM })
 
         val drawableFetcher = PhotopickerDrawableFetcher(drawableLoadable, mockContext)
         drawableFetcher.loadData(Priority.HIGH, mockCallback)
@@ -344,6 +349,32 @@ class LoadMediaTest {
         assertThat(packageName.value).isEqualTo(drawableLoadable.getLoadableUri().host)
         assertThat(userHandle.value).isEqualTo(UserHandle.of(context.userId))
         assertThat(resourceId.value).isEqualTo(R.drawable.android)
+    }
+
+    /**
+     * DiamaneOS: an icon of a package that is not on the system image (a cloud media provider's) is
+     * not loaded, so its image file is never decoded in the picker's process.
+     */
+    @Test
+    fun testDrawableFetcherRefusesIconOutsideSystemImage() {
+        whenever(
+            mockContext.createPackageContextAsUser(
+                any(String::class.java),
+                any(Int::class.java),
+                any(UserHandle::class.java),
+            )
+        ) {
+            mockContext
+        }
+        whenever(mockContext.getResources()).thenReturn(mockResources)
+        whenever(mockContext.getApplicationInfo()).thenReturn(ApplicationInfo())
+
+        val drawableFetcher = PhotopickerDrawableFetcher(drawableLoadable, mockContext)
+        drawableFetcher.loadData(Priority.HIGH, mockCallback)
+
+        verify(mockResources, never()).getDrawable(anyInt(), any())
+        verify(mockCallback).onLoadFailed(any())
+        verify(mockCallback, never()).onDataReady(any())
     }
 
     /** Ensures that a [GlideLoadable] can be loaded via the [loadMedia] composable using Glide. */

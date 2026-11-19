@@ -17,11 +17,18 @@
 package com.android.photopicker.util.test
 
 import android.content.ContentProvider
+import android.content.ContentResolver
 import android.content.res.AssetFileDescriptor
+import android.graphics.Point
 import android.net.Uri
 import android.os.Bundle
 import android.os.CancellationSignal
+import android.os.Parcel
+import android.os.ParcelFileDescriptor
+import android.provider.CloudMediaProviderContract
 import android.test.mock.MockContentProvider
+import com.android.photopicker.core.glide.PhotopickerMediaFetcher
+import kotlin.concurrent.thread
 
 /**
  * A small wrapper around MockContentProvider.
@@ -57,8 +64,50 @@ class MockContentProviderWrapper(val provider: ContentProvider) : MockContentPro
         return provider.openTypedAssetFile(uri, mimeType, opts)
     }
 
-    /** Pass calls to the wrapped provider. */
+    /**
+     * Pass calls to the wrapped provider. The picker's image call (DiamaneOS) is answered as
+     * MediaProvider answers it, with the wrapped provider's own file: MediaProvider opens the item
+     * with these options and writes a PNG of the pixels its decode service checked into the pipe.
+     * Here the test image goes into the pipe as it is.
+     */
     override fun call(authority: String, method: String, arg: String?, extras: Bundle?): Bundle? {
-        return provider.call(authority, method, arg, extras)
+        if (method != PhotopickerMediaFetcher.PICKER_IMAGE_CALL || arg == null || extras == null) {
+            return provider.call(authority, method, arg, extras)
+        }
+        // A copy, as binder makes one: the picker closes its own end as soon as the call returns.
+        val parcel = Parcel.obtain()
+        val received =
+            try {
+                extras.writeToParcel(parcel, 0)
+                parcel.setDataPosition(0)
+                Bundle.CREATOR.createFromParcel(parcel)
+            } finally {
+                parcel.recycle()
+            }
+        @Suppress("DEPRECATION")
+        val out =
+            received.getParcelable<ParcelFileDescriptor>(
+                PhotopickerMediaFetcher.EXTRA_PICKER_IMAGE_OUT
+            ) ?: return provider.call(authority, method, arg, extras)
+        val opts =
+            Bundle().apply {
+                @Suppress("DEPRECATION")
+                extras.getParcelable<Point>(ContentResolver.EXTRA_SIZE)?.let {
+                    putParcelable(ContentResolver.EXTRA_SIZE, it)
+                }
+                putBoolean(CloudMediaProviderContract.EXTRA_PREVIEW_THUMBNAIL, true)
+                if (extras.getBoolean(CloudMediaProviderContract.EXTRA_MEDIASTORE_THUMB)) {
+                    putBoolean(CloudMediaProviderContract.EXTRA_MEDIASTORE_THUMB, true)
+                }
+            }
+        val mime =
+            extras.getString(PhotopickerMediaFetcher.EXTRA_PICKER_IMAGE_MIME) ?: "image/*"
+        val afd = provider.openTypedAssetFile(Uri.parse(arg), mime, opts, CancellationSignal())
+        thread {
+            ParcelFileDescriptor.AutoCloseOutputStream(out).use { sink ->
+                afd?.createInputStream()?.use { it.copyTo(sink) }
+            }
+        }
+        return Bundle()
     }
 }
