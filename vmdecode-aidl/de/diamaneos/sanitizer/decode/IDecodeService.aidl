@@ -17,6 +17,7 @@
 package de.diamaneos.sanitizer.decode;
 
 import de.diamaneos.sanitizer.decode.DecodeRequest;
+import de.diamaneos.sanitizer.decode.Frames;
 import de.diamaneos.sanitizer.decode.ImageInfo;
 import de.diamaneos.sanitizer.decode.MetadataRecord;
 import de.diamaneos.sanitizer.decode.Thumbnail;
@@ -75,6 +76,11 @@ interface IDecodeService {
     const int MAX_ID_CHARS = 128;
     const int HANDLE_TIMEOUT_MILLIS = 30000;
 
+    /** Frames: at most this many frames, each at most this long, all pixels together at most this many bytes. */
+    const int MAX_FRAMES = 1024;
+    const int MAX_FRAME_MILLIS = 65535;
+    const int MAX_FRAMES_BYTES = 33554432;
+
     /** Header only: format, size, animation, from at most MAX_PROBE_BYTES. No pixels are decoded. */
     ImageInfo probe(in DecodeRequest request);
 
@@ -84,12 +90,22 @@ interface IDecodeService {
      */
     Thumbnail decodeThumbnail(in DecodeRequest request, int maxWidth, int maxHeight);
 
-    /** Stripe index of a decoded thumbnail. Exactly the documented length, or an empty array when the handle is gone. */
+    /**
+     * Stripe index of a decoded thumbnail, or of decoded frames (one tall image). Exactly the documented length, or an
+     * empty array when the handle is gone.
+     */
     byte[] readStripe(long handle, int index);
 
-    /** Frees a thumbnail's pixels in the service. */
+    /** Frees a thumbnail's or frames' pixels in the service. */
     void release(long handle);
 
     /** The fixed metadata record for an image. */
     MetadataRecord readMetadata(in DecodeRequest request);
+
+    /**
+     * An animation (GIF or WebP), every frame fitting maxWidth x maxHeight with its aspect ratio kept, scaled down
+     * further when all frames would exceed MAX_FRAMES_BYTES, and at most MAX_FRAMES of them. STATUS_UNSUPPORTED for
+     * another format. Last, so callers built before it keep their transaction numbers.
+     */
+    Frames decodeFrames(in DecodeRequest request, int maxWidth, int maxHeight);
 }

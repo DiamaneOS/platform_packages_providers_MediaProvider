@@ -54,17 +54,20 @@ public class PickerThumbnailFetcher implements DataFetcher<InputStream> {
     private final int mWidth;
     private final int mHeight;
     private final boolean mIsThumbRequest;
+    private final boolean mAnimate;
     private final CancellationSignal mCancellationSignal;
     @Nullable private AssetFileDescriptor mAssetFileDescriptor = null;
     @Nullable private InputStream mInputStream = null;
 
     PickerThumbnailFetcher(
-            Context context, GlideLoadable model, int width, int height, boolean isThumbRequest) {
+            Context context, GlideLoadable model, int width, int height, boolean isThumbRequest,
+            boolean animate) {
         mContext = context;
         mModel = model;
         mWidth = width;
         mHeight = height;
         mIsThumbRequest = isThumbRequest;
+        mAnimate = animate;
         mCancellationSignal = new CancellationSignal();
     }
 
@@ -103,8 +106,16 @@ public class PickerThumbnailFetcher implements DataFetcher<InputStream> {
             final int maxHeight = mHeight > 0 ? mHeight : screen;
             // The descriptor goes to the decode service as it is: a provider that stalls or never ends is
             // read by the service under its own deadline, never by a thread here.
-            final Bitmap bitmap = VmDecode.decodeAsset(mAssetFileDescriptor,
-                    VmDecode.pickerOwner(mContext, mModel.getLoadableUri()),
+            final String owner = VmDecode.pickerOwner(mContext, mModel.getLoadableUri());
+            if (mAnimate) {
+                // A GIF or animated WebP preview: every frame made in the VM, played by VmFrames' drawable.
+                final VmDecode.Animation a = VmDecode.decodeAssetAnimation(mAssetFileDescriptor, owner,
+                        VmDecode.PRIORITY_USER_WAITING, maxWidth, maxHeight, mCancellationSignal);
+                mInputStream = new ByteArrayInputStream(a.encoded);
+                callback.onDataReady(mInputStream);
+                return;
+            }
+            final Bitmap bitmap = VmDecode.decodeAsset(mAssetFileDescriptor, owner,
                     VmDecode.PRIORITY_USER_WAITING, maxWidth, maxHeight, mCancellationSignal);
             final ByteArrayOutputStream png = new ByteArrayOutputStream();
             bitmap.compress(Bitmap.CompressFormat.PNG, 100, png);

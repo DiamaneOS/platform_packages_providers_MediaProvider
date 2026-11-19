@@ -22,7 +22,10 @@ import android.os.Bundle
 import android.os.ParcelFileDescriptor
 import android.provider.CloudMediaProviderContract
 import android.provider.MediaStore
+import android.provider.MediaStore.Files.FileColumns._SPECIAL_FORMAT_ANIMATED_WEBP
+import android.provider.MediaStore.Files.FileColumns._SPECIAL_FORMAT_GIF
 import android.util.Log
+import com.android.photopicker.data.model.Media
 import com.bumptech.glide.Priority
 import com.bumptech.glide.load.DataSource
 import com.bumptech.glide.load.Options
@@ -61,6 +64,8 @@ class PhotopickerMediaFetcher(
         const val PICKER_IMAGE_CALL = "de.diamaneos.vmdecode.picker_image"
         const val EXTRA_PICKER_IMAGE_OUT = "de.diamaneos.vmdecode.picker_image_out"
         const val EXTRA_PICKER_IMAGE_MIME = "de.diamaneos.vmdecode.picker_image_mime"
+        // A preview of a GIF or an animated WebP: all frames, made in the VM (VmFrames), instead of a still image.
+        const val EXTRA_PICKER_IMAGE_FRAMES = "de.diamaneos.vmdecode.picker_image_frames"
     }
 
     // The read end of the pipe MediaProvider writes the image into, held open for Glide and closed
@@ -81,6 +86,9 @@ class PhotopickerMediaFetcher(
                         putBoolean(CloudMediaProviderContract.EXTRA_MEDIASTORE_THUMB, true)
                     }
                     putString(EXTRA_PICKER_IMAGE_MIME, model.getMimeTypeForGlide())
+                    if (animated()) {
+                        putBoolean(EXTRA_PICKER_IMAGE_FRAMES, true)
+                    }
                     putParcelable(EXTRA_PICKER_IMAGE_OUT, pipe[1])
                 }
             // The MediaProvider of the item's user (content://<user>@<authority>/...), which accepts only
@@ -111,6 +119,15 @@ class PhotopickerMediaFetcher(
      * Glide will call this when the resources this worker holds are no longer needed, so they can
      * be safely closed.
      */
+    /** A full-size request for a GIF or an animated WebP, which the picker plays as before. */
+    private fun animated(): Boolean {
+        val image = model as? Media.Image ?: return false
+        val full = options.get(RESOLUTION_REQUESTED)?.equals(Resolution.FULL) ?: false
+        return full &&
+            (image.standardMimeTypeExtension == _SPECIAL_FORMAT_GIF ||
+                image.standardMimeTypeExtension == _SPECIAL_FORMAT_ANIMATED_WEBP)
+    }
+
     override fun cleanup() {
         try {
             inputStream?.close()

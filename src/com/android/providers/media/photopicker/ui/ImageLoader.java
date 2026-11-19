@@ -33,6 +33,8 @@ import com.android.providers.media.photopicker.data.glide.GlideLoadable;
 import com.android.providers.media.photopicker.data.model.Category;
 import com.android.providers.media.photopicker.data.model.Item;
 
+import com.android.providers.media.vmdecode.frames.VmFrames;
+
 import com.bumptech.glide.Glide;
 import com.bumptech.glide.RequestBuilder;
 import com.bumptech.glide.load.Option;
@@ -117,8 +119,18 @@ public class ImageLoader {
      */
     public void loadImagePreview(@NonNull Item item, @NonNull ImageView imageView)  {
         final GlideLoadable loadable = item.toGlideLoadable();
-        // Every preview, GIF and animated WebP included, is a still image: the picker's fetcher hands Glide
-        // a PNG made from pixels decoded in the decode service's VM, never the original bytes.
+        if (item.isGifOrAnimatedWebp()) {
+            // A GIF or animated WebP plays: its frames are made in the decode service's VM and Glide gets them as
+            // checked pixels (VmFrames), never the original bytes.
+            loadWithGlide(
+                    getDrawableRequestBuilder(loadable).set(VmFrames.ANIMATE, true),
+                    /* requestOptions */ null,
+                    getGlideSignature(loadable, /* prefix= */ PREVIEW_PREFIX + "frames_"),
+                    imageView);
+            return;
+        }
+        // Every other preview is a still image: the picker's fetcher hands Glide a PNG made from pixels decoded
+        // in the decode service's VM, never the original bytes.
         loadWithGlide(
                 getBitmapRequestBuilder(loadable),
                 /* requestOptions */ null,

@@ -78,6 +78,52 @@ public final class DecodeChecks {
         return null;
     }
 
+    /** The rules of decoded frames for a box of maxWidth x maxHeight. Null when they hold, else what broke. */
+    public static String check(Frames f, int maxWidth, int maxHeight) {
+        if (f == null || !status(f.status)) return "status";
+        if (f.status != IDecodeService.STATUS_OK) return null;
+        if (!size(f.width, f.height, maxWidth, maxHeight)) return "size";
+        if (f.frameCount < 1 || f.frameCount > IDecodeService.MAX_FRAMES) return "frameCount";
+        if ((long) f.frameCount * f.width * f.height * 4 > IDecodeService.MAX_FRAMES_BYTES) return "bytes";
+        if (f.loopCount < 0 || f.loopCount > 65535) return "loopCount";
+        if (f.durations == null || f.durations.length != f.frameCount) return "durations";
+        for (int d : f.durations) {
+            if (d < 0 || d > IDecodeService.MAX_FRAME_MILLIS) return "duration";
+        }
+        if (f.colorSpace != IDecodeService.COLOR_SPACE_SRGB && f.colorSpace != IDecodeService.COLOR_SPACE_DISPLAY_P3) {
+            return "colorSpace";
+        }
+        long rows = (long) f.frameCount * f.height;
+        if (f.stripeRows < 1 || f.stripeRows > rows
+                || (long) f.stripeRows * f.width * 4 > IDecodeService.MAX_STRIPE_BYTES) {
+            return "stripeRows";
+        }
+        if (f.handle == 0) return "handle";
+        return null;
+    }
+
+    /** Stripe index of f's tall image: exactly its rows, premultiplied (no colour channel above alpha). */
+    public static String check(Frames f, int index, byte[] stripe) {
+        long rows = (long) f.frameCount * f.height;
+        long first = (long) index * f.stripeRows;
+        if (index < 0 || first >= rows) return "index";
+        long n = Math.min(f.stripeRows, rows - first);
+        if (stripe == null || stripe.length != n * f.width * 4) return "stripe length";
+        for (int i = 0; i < stripe.length; i += 4) {
+            int a = stripe[i + 3] & 0xff;
+            if ((stripe[i] & 0xff) > a || (stripe[i + 1] & 0xff) > a || (stripe[i + 2] & 0xff) > a) {
+                return "colour above alpha";
+            }
+        }
+        return null;
+    }
+
+    /** The android.graphics.ColorSpace checked frames are built in. */
+    public static android.graphics.ColorSpace colorSpaceOf(Frames f) {
+        return android.graphics.ColorSpace.get(f.colorSpace == IDecodeService.COLOR_SPACE_DISPLAY_P3
+                ? android.graphics.ColorSpace.Named.DISPLAY_P3 : android.graphics.ColorSpace.Named.SRGB);
+    }
+
     /** The android.graphics.ColorSpace a checked thumbnail's Bitmap is built in. */
     public static android.graphics.ColorSpace colorSpaceOf(Thumbnail t) {
         return android.graphics.ColorSpace.get(t.colorSpace == IDecodeService.COLOR_SPACE_DISPLAY_P3

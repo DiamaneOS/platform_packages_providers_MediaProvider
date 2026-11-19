@@ -9,6 +9,8 @@ android_library {
     srcs: [
         "src/**/*.kt",
         ":statslog-mediaprovider-java-gen",
+        // DiamaneOS: animations from the decode service (VmFrames).
+        ":mediaprovider-vmdecode-frames",
     ],
     resource_dirs: ["res"],
     sdk_version: "module_current",

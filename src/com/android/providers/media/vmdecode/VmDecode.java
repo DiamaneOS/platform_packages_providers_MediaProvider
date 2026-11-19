@@ -52,6 +52,7 @@ import com.android.providers.media.util.MimeUtils;
 
 import de.diamaneos.sanitizer.decode.DecodeChecks;
 import de.diamaneos.sanitizer.decode.DecodeRequest;
+import de.diamaneos.sanitizer.decode.Frames;
 import de.diamaneos.sanitizer.decode.IDecodeService;
 import de.diamaneos.sanitizer.decode.ImageInfo;
 import de.diamaneos.sanitizer.decode.MetadataRecord;
@@ -319,6 +320,22 @@ public final class VmDecode {
      */
     public static @NonNull Bitmap decodeAsset(@NonNull AssetFileDescriptor asset, @Nullable String owner,
             int priority, int maxWidth, int maxHeight, @Nullable CancellationSignal signal) throws IOException {
+        return withAsset(asset, owner, pfd -> decode(pfd, owner, priority, null, maxWidth, maxHeight, signal));
+    }
+
+    /** As {@link #decodeAsset}, an animation (GIF or WebP) frame by frame. */
+    public static @NonNull Animation decodeAssetAnimation(@NonNull AssetFileDescriptor asset, @Nullable String owner,
+            int priority, int maxWidth, int maxHeight, @Nullable CancellationSignal signal) throws IOException {
+        return withAsset(asset, owner, pfd -> decodeFrames(pfd, owner, priority, maxWidth, maxHeight, signal));
+    }
+
+    private interface WithFile<T> {
+        T run(ParcelFileDescriptor pfd) throws IOException;
+    }
+
+    // The asset as the service takes it: a FUSE file or a part of a file through a memory file, else as it is.
+    private static <T> T withAsset(AssetFileDescriptor asset, @Nullable String owner, WithFile<T> work)
+            throws IOException {
         final ParcelFileDescriptor pfd = asset.getParcelFileDescriptor();
         final long offset = asset.getStartOffset();
         final long length = asset.getDeclaredLength();
@@ -328,7 +345,7 @@ public final class VmDecode {
             final byte[] bytes = SourceReader.read(pfd, offset, length, IDecodeService.MAX_BUFFERED_BYTES, false,
                     owner, COPY_DEADLINE_MILLIS);
             try (ParcelFileDescriptor memory = memoryFile(bytes, bytes.length)) {
-                return decode(memory, owner, priority, null, maxWidth, maxHeight, signal);
+                return work.run(memory);
             }
         }
         final StructStat st;
@@ -342,13 +359,13 @@ public final class VmDecode {
             if (!regular && offset != 0) {
                 throw new VmDecodeRejectedException("offset into a stream");
             }
-            return decode(pfd, owner, priority, null, maxWidth, maxHeight, signal);
+            return work.run(pfd);
         }
         if (length < 0 || length > IDecodeService.MAX_BUFFERED_BYTES || offset < 0) {
             throw new VmDecodeRejectedException("asset part out of range");
         }
         try (ParcelFileDescriptor part = copyToMemory(pfd.getFileDescriptor(), offset, (int) length)) {
-            return decode(part, owner, priority, null, maxWidth, maxHeight, signal);
+            return work.run(part);
         }
     }
 
@@ -384,6 +401,8 @@ public final class VmDecode {
     public static final String PICKER_IMAGE_CALL = "de.diamaneos.vmdecode.picker_image";
     public static final String EXTRA_PICKER_IMAGE_OUT = "de.diamaneos.vmdecode.picker_image_out";
     public static final String EXTRA_PICKER_IMAGE_MIME = "de.diamaneos.vmdecode.picker_image_mime";
+    // A GIF or animated WebP preview: all frames in the VmFrames form instead of a PNG.
+    public static final String EXTRA_PICKER_IMAGE_FRAMES = "de.diamaneos.vmdecode.picker_image_frames";
     // A few at a time, the rest wait briefly: the picker shows a grid, and a load past these is refused (the picker
     // retries when the cell comes back into view).
     private static final ThreadPoolExecutor sPickerImages = new ThreadPoolExecutor(4, 4, 30, TimeUnit.SECONDS,
@@ -421,8 +440,9 @@ public final class VmDecode {
         if (extras.getBoolean(CloudMediaProviderContract.EXTRA_MEDIASTORE_THUMB)) {
             opts.putBoolean(CloudMediaProviderContract.EXTRA_MEDIASTORE_THUMB, true);
         }
+        final boolean frames = extras.getBoolean(EXTRA_PICKER_IMAGE_FRAMES);
         try {
-            sPickerImages.execute(() -> writePickerImage(context, uri, mime, opts, size, out));
+            sPickerImages.execute(() -> writePickerImage(context, uri, mime, opts, size, frames, out));
         } catch (RejectedExecutionException e) {
             closeWithError(out, "busy");
         }
@@ -507,7 +527,7 @@ public final class VmDecode {
     }
 
     private static void writePickerImage(Context context, Uri uri, String mime, Bundle opts, @Nullable Point size,
-            ParcelFileDescriptor out) {
+            boolean frames, ParcelFileDescriptor out) {
         // MediaProvider's own identity opens the item, checked against the picker's own access (checkPickerUri).
         final CancellationSignal signal = new CancellationSignal();
         boolean written = false;
@@ -529,12 +549,19 @@ public final class VmDecode {
             final int screen = Math.max(metrics.widthPixels, metrics.heightPixels);
             final int maxWidth = size != null && size.x > 0 ? size.x : screen;
             final int maxHeight = size != null && size.y > 0 ? size.y : screen;
-            final Bitmap bitmap = decodeAsset(asset, pickerOwner(context, uri), PRIORITY_USER_WAITING, maxWidth,
-                    maxHeight, signal);
-            final ByteArrayOutputStream png = new ByteArrayOutputStream();
-            bitmap.compress(Bitmap.CompressFormat.PNG, 100, png);
-            bitmap.recycle();
-            final byte[] bytes = png.toByteArray();
+            final byte[] bytes;
+            if (frames) {
+                final Animation a = decodeAssetAnimation(asset, pickerOwner(context, uri), PRIORITY_USER_WAITING,
+                        maxWidth, maxHeight, signal);
+                bytes = a.encoded;
+            } else {
+                final Bitmap bitmap = decodeAsset(asset, pickerOwner(context, uri), PRIORITY_USER_WAITING, maxWidth,
+                        maxHeight, signal);
+                final ByteArrayOutputStream png = new ByteArrayOutputStream();
+                bitmap.compress(Bitmap.CompressFormat.PNG, 100, png);
+                bitmap.recycle();
+                bytes = png.toByteArray();
+            }
             writeWithDeadline(out, bytes, bytes.length);
             written = true;
         } catch (Throwable t) {
@@ -725,6 +752,58 @@ public final class VmDecode {
                         true, DecodeChecks.colorSpaceOf(reply));
                 bitmap.copyPixelsFromBuffer(ByteBuffer.wrap(frame));
                 return rotate(bitmap, reply.rotation);
+            } finally {
+                try {
+                    service.release(reply.handle);
+                } catch (RemoteException ignored) {
+                    // The service frees it after its timeout.
+                }
+            }
+        });
+    }
+
+    /**
+     * A decoded animation, in VmFrames' form: the header (size, frame count, loop count, colour space, each frame's
+     * time), then every frame's checked pixels, held once.
+     */
+    public static final class Animation {
+        public final byte[] encoded;
+
+        Animation(byte[] encoded) {
+            this.encoded = encoded;
+        }
+    }
+
+    private static Animation decodeFrames(ParcelFileDescriptor pfd, @Nullable String owner, int priority,
+            int maxWidth, int maxHeight, @Nullable CancellationSignal signal) throws IOException {
+        final DecodeRequest request = request(pfd, owner, priority, null);
+        return client().call(priority, owner, service -> {
+            final Frames reply = service.decodeFrames(request, maxWidth, maxHeight);
+            checkReply(reply == null, DecodeChecks.check(reply, maxWidth, maxHeight));
+            checkStatus(reply.status);
+            try {
+                // One tall image, frame after frame, every stripe checked before it is copied straight behind the
+                // VmFrames header (DecodeChecks bounds it to MAX_FRAMES_BYTES).
+                final int rowBytes = reply.width * 4;
+                final int rows = reply.frameCount * reply.height;
+                final int stripes = (rows + reply.stripeRows - 1) / reply.stripeRows;
+                final int head = com.android.providers.media.vmdecode.frames.VmFrames.headerBytes(reply.frameCount);
+                final byte[] all = new byte[head + rowBytes * rows];
+                com.android.providers.media.vmdecode.frames.VmFrames.putHeader(all, reply.width, reply.height,
+                        reply.frameCount, reply.loopCount,
+                        reply.colorSpace == IDecodeService.COLOR_SPACE_DISPLAY_P3, reply.durations);
+                for (int i = 0; i < stripes; i++) {
+                    if (signal != null && signal.isCanceled()) {
+                        throw new RemoteException("canceled");
+                    }
+                    final byte[] stripe = service.readStripe(reply.handle, i);
+                    final String bad = DecodeChecks.check(reply, i, stripe);
+                    if (bad != null) {
+                        throw new VmDecodeRejectedException("bad stripe " + i + ": " + bad, true);
+                    }
+                    System.arraycopy(stripe, 0, all, head + i * reply.stripeRows * rowBytes, stripe.length);
+                }
+                return new Animation(all);
             } finally {
                 try {
                     service.release(reply.handle);
