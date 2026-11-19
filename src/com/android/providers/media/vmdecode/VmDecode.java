@@ -751,6 +751,29 @@ public final class VmDecode {
                 final Bitmap bitmap = Bitmap.createBitmap(reply.width, reply.height, Bitmap.Config.ARGB_8888,
                         true, DecodeChecks.colorSpaceOf(reply));
                 bitmap.copyPixelsFromBuffer(ByteBuffer.wrap(frame));
+                // Ultra HDR: the gain map, every stripe checked, attached as Android's decode attaches it, so a
+                // thumbnail encoded from this bitmap keeps it.
+                if (reply.gainmapWidth > 0) {
+                    final int gainRowBytes = reply.gainmapWidth * 4;
+                    final byte[] gain = new byte[gainRowBytes * reply.gainmapHeight];
+                    final int gainStripes = (reply.gainmapHeight + reply.gainmapStripeRows - 1)
+                            / reply.gainmapStripeRows;
+                    for (int i = 0; i < gainStripes; i++) {
+                        final byte[] stripe = service.readGainmapStripe(reply.handle, i);
+                        final String bad = DecodeChecks.checkGainmap(reply, i, stripe);
+                        if (bad != null) {
+                            throw new VmDecodeRejectedException("bad gain map stripe " + i + ": " + bad, true);
+                        }
+                        System.arraycopy(stripe, 0, gain, i * reply.gainmapStripeRows * gainRowBytes,
+                                stripe.length);
+                    }
+                    if (android.os.Build.VERSION.SDK_INT >= 34) {
+                        final android.graphics.Gainmap gainmap = DecodeChecks.gainmapOf(reply, gain);
+                        if (gainmap != null) {
+                            bitmap.setGainmap(gainmap);
+                        }
+                    }
+                }
                 return rotate(bitmap, reply.rotation);
             } finally {
                 try {

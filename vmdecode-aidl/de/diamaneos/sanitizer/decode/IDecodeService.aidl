@@ -81,6 +81,9 @@ interface IDecodeService {
     const int MAX_FRAME_MILLIS = 65535;
     const int MAX_FRAMES_BYTES = 33554432;
 
+    /** Thumbnail.gainmapParams: this many values. */
+    const int GAINMAP_PARAMS = 17;
+
     /** Header only: format, size, animation, from at most MAX_PROBE_BYTES. No pixels are decoded. */
     ImageInfo probe(in DecodeRequest request);
 
@@ -108,4 +111,10 @@ interface IDecodeService {
      * another format. Last, so callers built before it keep their transaction numbers.
      */
     Frames decodeFrames(in DecodeRequest request, int maxWidth, int maxHeight);
+
+    /**
+     * Stripe index of a thumbnail's gain map (Thumbnail.gainmapStripeRows rows of gainmapWidth * 4 bytes). Exactly
+     * that length, or an empty array when the handle is gone or has no gain map.
+     */
+    byte[] readGainmapStripe(long handle, int index);
 }
