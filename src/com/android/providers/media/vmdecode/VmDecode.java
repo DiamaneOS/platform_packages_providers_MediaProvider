@@ -624,7 +624,9 @@ public final class VmDecode {
                     }
                     System.arraycopy(stripe, 0, frame, i * reply.stripeRows * rowBytes, stripe.length);
                 }
-                final Bitmap bitmap = Bitmap.createBitmap(reply.width, reply.height, Bitmap.Config.ARGB_8888);
+                // In the file's colour space, as Android's decode gives it (sRGB or Display P3).
+                final Bitmap bitmap = Bitmap.createBitmap(reply.width, reply.height, Bitmap.Config.ARGB_8888,
+                        true, DecodeChecks.colorSpaceOf(reply));
                 bitmap.copyPixelsFromBuffer(ByteBuffer.wrap(frame));
                 return rotate(bitmap, reply.rotation);
             } finally {

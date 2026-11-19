@@ -53,6 +53,10 @@ interface IDecodeService {
     const int FORMAT_ICO = 9;
     const int FORMAT_WBMP = 10;
 
+    /** Thumbnail.colorSpace: android.graphics.ColorSpace.Named.SRGB and DISPLAY_P3. */
+    const int COLOR_SPACE_SRGB = 0;
+    const int COLOR_SPACE_DISPLAY_P3 = 1;
+
     /**
      * Thumbnails and metadata: a longer input is refused (STATUS_INVALID). A regular file the service can read without
      * stalling (not on FUSE) longer than MAX_BUFFERED_BYTES is streamed to the VM, never held whole, and is decoded

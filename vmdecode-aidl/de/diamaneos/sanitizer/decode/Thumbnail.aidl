@@ -37,4 +37,11 @@ parcelable Thumbnail {
 
     /** For readStripe and release. Valid until release or IDecodeService.HANDLE_TIMEOUT_MILLIS. */
     long handle;
+
+    /**
+     * The pixels' colour space, IDecodeService.COLOR_SPACE_*: the file's own when it is sRGB or Display P3, as
+     * Android's decode keeps it, otherwise the nearest of the two that holds its gamut. The caller builds its Bitmap
+     * in it. Last, so a caller built before it reads sRGB.
+     */
+    int colorSpace;
 }

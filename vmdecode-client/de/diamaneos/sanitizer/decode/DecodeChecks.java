@@ -72,7 +72,16 @@ public final class DecodeChecks {
             return "stripeRows";
         }
         if (t.handle == 0) return "handle";
+        if (t.colorSpace != IDecodeService.COLOR_SPACE_SRGB && t.colorSpace != IDecodeService.COLOR_SPACE_DISPLAY_P3) {
+            return "colorSpace";
+        }
         return null;
+    }
+
+    /** The android.graphics.ColorSpace a checked thumbnail's Bitmap is built in. */
+    public static android.graphics.ColorSpace colorSpaceOf(Thumbnail t) {
+        return android.graphics.ColorSpace.get(t.colorSpace == IDecodeService.COLOR_SPACE_DISPLAY_P3
+                ? android.graphics.ColorSpace.Named.DISPLAY_P3 : android.graphics.ColorSpace.Named.SRGB);
     }
 
     /** Stripe index of t: exactly its rows, premultiplied (no colour channel above alpha). */
