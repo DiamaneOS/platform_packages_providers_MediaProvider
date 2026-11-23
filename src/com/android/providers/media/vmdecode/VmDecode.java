@@ -607,7 +607,7 @@ public final class VmDecode {
                 }
                 // In the file's colour space, as Android's decode gives it (sRGB or Display P3).
                 final Bitmap bitmap = Bitmap.createBitmap(reply.width, reply.height, Bitmap.Config.ARGB_8888,
-                        true, DecodeChecks.colorSpaceOf(reply));
+                        true, android.graphics.GateColorSpaces.of(reply.colorSpace, reply.colorDescription));
                 bitmap.copyPixelsFromBuffer(ByteBuffer.wrap(frame));
                 // Ultra HDR: the gain map, every stripe checked, attached as Android's decode attaches it, so a
                 // thumbnail encoded from this bitmap keeps it.
