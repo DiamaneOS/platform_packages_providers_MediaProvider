@@ -31,9 +31,12 @@ import androidx.annotation.GuardedBy;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
+import de.diamaneos.sanitizer.decode.DecodeRequest;
 import de.diamaneos.sanitizer.decode.IDecodeService;
 
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -65,6 +68,18 @@ final class DecodeClient {
     // means the service broke its deadline.
     private static final long CALL_TIMEOUT_USER_WAITING_MS = 25_000;
     private static final long CALL_TIMEOUT_BACKGROUND_MS = 75_000;
+
+    // The prepare hint: at most this often (queries come in bursts), sent from one thread of its own that binds when
+    // needed, so the query that sends it never waits. A hint that finds the thread busy is dropped.
+    private static final long PREPARE_GAP_MS = 2_000;
+    private static final ThreadPoolExecutor PREPARE = new ThreadPoolExecutor(0, 1, 30, TimeUnit.SECONDS,
+            new ArrayBlockingQueue<>(1), r -> {
+                final Thread t = new Thread(r, "VmDecodePrepare");
+                t.setDaemon(true);
+                return t;
+            }, new ThreadPoolExecutor.DiscardPolicy());
+    @GuardedBy("mLock")
+    private final java.util.LinkedHashMap<Integer, Long> mLastPrepare = new java.util.LinkedHashMap<>();
 
     /** One call to the service. */
     interface Call<T> {
@@ -176,7 +191,7 @@ final class DecodeClient {
                 lane.queue.remove(key, task);
                 throw e;
             }
-            if (!task.started.await(boundedQueueWait, TimeUnit.MILLISECONDS) && lane.queue.remove(key, task)) {
+            if (!await(task.started, boundedQueueWait) && lane.queue.remove(key, task)) {
                 // Never started: the service is not at fault, the binding stays.
                 throw new VmDecodeUnavailableException("waited too long in the queue");
             }
@@ -184,7 +199,7 @@ final class DecodeClient {
             final long end = VmDecode.boundEnd();
             final long boundedCallWait = end == 0 ? callWait
                     : Math.max(1, Math.min(callWait, end - SystemClock.uptimeMillis()));
-            if (!task.done.await(boundedCallWait, TimeUnit.MILLISECONDS)) {
+            if (!await(task.done, boundedCallWait)) {
                 if (boundedCallWait < callWait) {
                     // Only this caller's bound ran out: the service may still answer in its time, the call runs on
                     // in its lane and the binding stays.
@@ -195,6 +210,9 @@ final class DecodeClient {
                 unbind();
                 throw new VmDecodeUnavailableException("decode service missed its deadline");
             }
+        } catch (android.os.OperationCanceledException e) {
+            lane.queue.remove(key, task);
+            throw e;
         } catch (InterruptedException e) {
             lane.queue.remove(key, task);
             Thread.currentThread().interrupt();
@@ -207,6 +225,40 @@ final class DecodeClient {
             throw new VmDecodeUnavailableException("decode call failed", task.error);
         }
         return task.result;
+    }
+
+    private static boolean await(CountDownLatch latch, long timeout) throws InterruptedException {
+        final long end = SystemClock.uptimeMillis() + timeout;
+        while (true) {
+            VmDecode.checkBoundCancellation();
+            final long left = end - SystemClock.uptimeMillis();
+            if (left <= 0) return latch.getCount() == 0;
+            if (latch.await(Math.min(left, 50), TimeUnit.MILLISECONDS)) return true;
+        }
+    }
+
+    /**
+     * Tells the service that thumbnails of this user follow soon, so it may start its VM for them now. Never waits
+     * and never fails: a hint that cannot be sent is dropped.
+     */
+    void prepare(int sourceUser) {
+        final long now = SystemClock.uptimeMillis();
+        synchronized (mLock) {
+            if (now - mLastPrepare.getOrDefault(sourceUser, -PREPARE_GAP_MS) < PREPARE_GAP_MS) {
+                return;
+            }
+            mLastPrepare.put(sourceUser, now);
+            if (mLastPrepare.size() > 32) mLastPrepare.remove(mLastPrepare.keySet().iterator().next());
+        }
+        PREPARE.execute(() -> {
+            try {
+                final DecodeRequest request = new DecodeRequest();
+                request.ownerUser = sourceUser;
+                connect(CONNECT_TIMEOUT_USER_WAITING_MS).prepare(request);
+            } catch (VmDecodeUnavailableException | RemoteException | RuntimeException e) {
+                Log.w(TAG, "prepare hint not sent: " + e.getMessage());
+            }
+        });
     }
 
     /** A call waiting in a lane. */
@@ -313,6 +365,7 @@ final class DecodeClient {
             }
             final long end = SystemClock.uptimeMillis() + timeoutMs;
             while (mService == null) {
+                VmDecode.checkBoundCancellation();
                 if (!mBinding) throw new VmDecodeUnavailableException("decode binding was dropped");
                 final long left = end - SystemClock.uptimeMillis();
                 if (left <= 0) {
@@ -320,7 +373,7 @@ final class DecodeClient {
                     throw new VmDecodeUnavailableException("decode service did not connect in time");
                 }
                 try {
-                    mLock.wait(left);
+                    mLock.wait(Math.min(left, 50));
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     throw new VmDecodeUnavailableException("interrupted", e);

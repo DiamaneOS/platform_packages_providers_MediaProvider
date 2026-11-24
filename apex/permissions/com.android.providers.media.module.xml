@@ -16,7 +16,7 @@
   -->
 <permissions>
     <privapp-permissions package="com.android.providers.media.module">
-        <!-- Image decoding in the decode service's protected VM (de.diamaneos.sanitizer). -->
+        <!-- DiamaneOS: image decoding in the decode service's protected VM (de.diamaneos.sanitizer). -->
         <permission name="de.diamaneos.sanitizer.permission.DECODE"/>
         <permission name="android.permission.INTERACT_ACROSS_USERS"/>
         <permission name="android.permission.MANAGE_USERS"/>

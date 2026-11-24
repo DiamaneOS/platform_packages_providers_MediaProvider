@@ -70,13 +70,7 @@ public class SpecialFormatDetector {
     private static final String SEMANTIC_PRIMARY = "Primary";
     private static final String SEMANTIC_MOTION_PHOTO = "MotionPhoto";
 
-    /**
-     * {@return} special format for a file
-     */
-    public static int detect(File file) throws Exception {
-        return detect(file, null);
-    }
-
+    // DiamaneOS: the detection takes the owner of the file's bytes, for the decode service's fair queue.
     /**
      * {@return} special format for a file whose bytes came from {@code owner}. Throws
      * VmDecodeUnavailableException or VmDecodeRejectedException when the decode service gave no real answer: the
@@ -87,13 +81,6 @@ public class SpecialFormatDetector {
             final ExifInterface exif = new ExifInterface(is);
             return detect(exif, file, owner);
         }
-    }
-
-    /**
-     * {@return} special format for a file
-     */
-    public static int detect(ExifInterface exif, File file) throws Exception {
-        return detect(exif, file, null);
     }
 
     /**

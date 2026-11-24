@@ -120,8 +120,8 @@ public class ImageLoader {
     public void loadImagePreview(@NonNull Item item, @NonNull ImageView imageView)  {
         final GlideLoadable loadable = item.toGlideLoadable();
         if (item.isGifOrAnimatedWebp()) {
-            // A GIF or animated WebP plays: its frames are made in the decode service's VM and Glide gets them as
-            // checked pixels (VmFrames), never the original bytes.
+            // DiamaneOS: a GIF or animated WebP plays: its frames are made in the decode service's VM and Glide gets
+            // them as checked pixels (VmFrames), never the original bytes.
             loadWithGlide(
                     getDrawableRequestBuilder(loadable).set(VmFrames.ANIMATE, true),
                     /* requestOptions */ null,

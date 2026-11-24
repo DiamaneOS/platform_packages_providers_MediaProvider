@@ -40,7 +40,6 @@ import java.util.concurrent.TimeUnit;
 final class SourceReader {
     static final int MAX_ABANDONED_PER_OWNER = 2;
     static final int MAX_ABANDONED = 8;
-    private static final int MAX_ACTIVE = 4;
     private static final SourceBudget sBudget = new SourceBudget();
     private static final ThreadPoolExecutor sIo = new ThreadPoolExecutor(0, MAX_ABANDONED, 30,
             TimeUnit.SECONDS, new SynchronousQueue<>(), r -> {
@@ -76,7 +75,9 @@ final class SourceReader {
             @Nullable String owner, long deadlineMillis) throws IOException {
         return SourceWork.call(sIo, sBudget, owner, 2L * limit, deadlineMillis, () -> {
             try (ParcelFileDescriptor input = pfd.dup()) {
-                return readAll(input.getFileDescriptor(), offset, length, limit, prefix);
+                final byte[] bytes = readAll(input.getFileDescriptor(), offset, length, limit, prefix);
+                input.checkError();
+                return bytes;
             }
         }, bytes -> { });
     }
@@ -107,6 +108,120 @@ final class SourceReader {
                 return new Prepared(prepared, identity);
             }
         }, Prepared::close);
+    }
+
+    static ParcelFileDescriptor openDisplay(android.content.ContentResolver resolver, android.net.Uri uri,
+            String principal) throws IOException {
+        final android.os.CancellationSignal signal = VmDecode.boundSignal() == null
+                ? new android.os.CancellationSignal() : VmDecode.boundSignal();
+        try {
+            return SourceWork.call(sIo, sBudget, principal, 0, 10_000, () -> {
+                signal.throwIfCanceled();
+                final ParcelFileDescriptor file = resolver.openFileDescriptor(uri, "r", signal);
+                if (file == null) throw new IOException("No display source");
+                return file;
+            }, ParcelFileDescriptor::close);
+        } catch (IOException | RuntimeException e) {
+            cancel(signal);
+            throw e;
+        }
+    }
+
+    static VmMediaRows.Source displaySource(android.content.ContentResolver resolver, android.net.Uri uri)
+            throws IOException {
+        final android.os.CancellationSignal signal = VmDecode.boundSignal();
+        return SourceWork.call(sIo, sBudget, uri.getAuthority(), 0, 10_000,
+                () -> VmMediaRows.forDisplay(resolver, uri, signal), source -> { });
+    }
+
+    static android.content.res.AssetFileDescriptor openTypedDisplay(android.content.ContentResolver resolver,
+            android.net.Uri uri, android.os.Bundle options) throws IOException {
+        final android.os.CancellationSignal signal = VmDecode.boundSignal() == null
+                ? new android.os.CancellationSignal() : VmDecode.boundSignal();
+        try {
+            return SourceWork.call(sIo, sBudget, uri.getAuthority(), 0, 10_000, () -> {
+                signal.throwIfCanceled();
+                final android.content.res.AssetFileDescriptor asset = resolver.openTypedAssetFileDescriptor(
+                        uri, "image/*", options, signal);
+                if (asset == null) throw new IOException("No display thumbnail source");
+                return asset;
+            }, android.content.res.AssetFileDescriptor::close);
+        } catch (IOException | RuntimeException e) {
+            cancel(signal);
+            throw e;
+        }
+    }
+
+    static android.content.res.AssetFileDescriptor openPicker(android.content.Context context,
+            android.net.Uri uri, String mime, android.os.Bundle options,
+            android.os.CancellationSignal signal) throws IOException {
+        return SourceWork.call(sIo, sBudget, uri.getAuthority(), 0, 10_000, () -> {
+            signal.throwIfCanceled();
+            final android.content.res.AssetFileDescriptor asset = context.getContentResolver()
+                    .openTypedAssetFileDescriptor(uri, mime, options, signal);
+            if (asset == null) throw new IOException("No picker asset");
+            return asset;
+        }, android.content.res.AssetFileDescriptor::close);
+    }
+
+    static VmMediaRows.Source pickerSource(android.content.Context context, android.net.Uri uri)
+            throws IOException {
+        return SourceWork.call(sIo, sBudget, uri.getAuthority(), 0, 10_000,
+                () -> VmMediaRows.picker(context, uri), value -> { });
+    }
+
+    static void verifyPicker(android.content.Context context, android.net.Uri uri,
+            VmMediaRows.Source source) throws IOException {
+        SourceWork.call(sIo, sBudget, uri.getAuthority(), 0, 10_000, () -> {
+            VmMediaRows.verify(context, uri, source);
+            return Boolean.TRUE;
+        }, value -> { });
+    }
+
+    static ParcelFileDescriptor prepareAsset(android.content.res.AssetFileDescriptor asset,
+            String principal) throws IOException {
+        final long offset = asset.getStartOffset();
+        final long length = asset.getDeclaredLength();
+        return SourceWork.call(sIo, sBudget, principal,
+                2L * de.diamaneos.sanitizer.decode.IDecodeService.MAX_BUFFERED_BYTES, 10_000, () -> {
+            try (ParcelFileDescriptor input = asset.getParcelFileDescriptor().dup()) {
+                final StructStat stat;
+                try {
+                    stat = Os.fstat(input.getFileDescriptor());
+                } catch (ErrnoException e) {
+                    throw new IOException("Asset stat failed", e);
+                }
+                final boolean regular = OsConstants.S_ISREG(stat.st_mode);
+                if (offset < 0 || length < -1 || (!regular && offset != 0)
+                        || (regular && (offset > stat.st_size
+                                || (length >= 0 && length > stat.st_size - offset)))) {
+                    throw new VmDecodeRejectedException("Asset extent is invalid", true);
+                }
+                if (!onFuse(input) && ((regular && offset == 0
+                        && (length < 0 || length == stat.st_size)) || (!regular && length < 0))) {
+                    return input.dup();
+                }
+                final byte[] bytes = readAll(input.getFileDescriptor(), offset, length,
+                        de.diamaneos.sanitizer.decode.IDecodeService.MAX_BUFFERED_BYTES, false);
+                input.checkError();
+                return VmDecode.memoryFile(bytes, bytes.length);
+            }
+        }, ParcelFileDescriptor::close);
+    }
+
+    private static final ThreadPoolExecutor sCancel = new ThreadPoolExecutor(0, 2, 30,
+            TimeUnit.SECONDS, new SynchronousQueue<>(), r -> {
+                final Thread thread = new Thread(r, "VmSourceCancel");
+                thread.setDaemon(true);
+                return thread;
+            }, new ThreadPoolExecutor.DiscardPolicy());
+
+    static void cancel(android.os.CancellationSignal signal) {
+        sCancel.execute(signal::cancel);
+    }
+
+    static <T> T metadata(String principal, long timeout, SourceWork.Work<T> work) throws IOException {
+        return SourceWork.call(sIo, sBudget, principal, 32L * 1024 * 1024, timeout, work, value -> { });
     }
 
     static final class Prepared implements AutoCloseable {

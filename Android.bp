@@ -134,8 +134,8 @@ filegroup {
     ],
 }
 
-// The decode service's API (de.diamaneos.sanitizer, IDecodeService). An exact copy of the decode service's files
-// (packages/apps/DiamaneOSSanitizer), whose build rule decode_api_copies_check fails when they differ.
+// DiamaneOS: the decode service's API (de.diamaneos.sanitizer, IDecodeService). An exact copy of the decode service's
+// files (packages/apps/DiamaneOSSanitizer), whose build rule decode_api_copies_check fails when they differ.
 filegroup {
     name: "mediaprovider-vmdecode-aidl",
     srcs: ["vmdecode-aidl/**/*.aidl"],

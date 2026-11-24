@@ -30,6 +30,7 @@ final class SourceWork {
 
     static <T> T call(ThreadPoolExecutor pool, SourceBudget budget, String principal, long bytes,
             long timeout, Work<T> work, Dispose<T> dispose) throws IOException {
+        VmDecode.checkBoundCancellation();
         final long bound = VmDecode.boundEnd();
         final long end = Math.min(SystemClock.uptimeMillis() + timeout,
                 bound == 0 ? Long.MAX_VALUE : bound);
@@ -40,6 +41,10 @@ final class SourceWork {
         try {
             pool.execute(() -> {
                 try {
+                    if (result.isCancelled()) return;
+                    if (SystemClock.uptimeMillis() >= end) {
+                        throw new VmDecodeUnavailableException("source deadline expired before start");
+                    }
                     final T value = work.run();
                     if (!result.complete(value)) close(dispose, value);
                 } catch (Throwable e) {
@@ -54,7 +59,7 @@ final class SourceWork {
         }
         try {
             while (true) {
-                if (VmDecode.boundSignal() != null) VmDecode.boundSignal().throwIfCanceled();
+                VmDecode.checkBoundCancellation();
                 final long left = end - SystemClock.uptimeMillis();
                 if (left <= 0) throw new TimeoutException();
                 try {
@@ -74,6 +79,10 @@ final class SourceWork {
             abandon(result, dispose);
             throw e;
         } catch (ExecutionException e) {
+            if (e.getCause() instanceof IOException
+                    && VmDecodeUnavailableException.isUnavailable((IOException) e.getCause())) {
+                VmDecode.countUnavailable();
+            }
             if (e.getCause() instanceof IOException) throw (IOException) e.getCause();
             throw new IOException("source work failed", e.getCause());
         }

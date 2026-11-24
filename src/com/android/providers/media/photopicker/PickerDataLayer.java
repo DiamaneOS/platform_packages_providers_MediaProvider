@@ -147,6 +147,8 @@ public class PickerDataLayer {
     }
 
     private Cursor fetchMediaInternal(Bundle queryArgs) {
+        // DiamaneOS: the picker's thumbnails of this user follow
+        com.android.providers.media.vmdecode.VmDecode.prepare();
         if (DEBUG) {
             Log.d(TAG, "fetchMediaInternal() "
                     + (queryArgs.getBoolean(QUERY_ARG_LOCAL_ONLY) ? "LOCAL_ONLY" : "ALL")

@@ -1032,7 +1032,7 @@ public class PermissionActivity extends Activity {
         public static final int LOAD_THUMBNAIL = 1 << 1;
         public static final int LOAD_FULL = 1 << 2;
 
-        /** The owner package of a media item, or null. */
+        /** DiamaneOS: the owner package of a media item, or null. */
         private static String queryOwner(ContentResolver resolver, Uri uri) {
             try (Cursor c = resolver.query(uri, new String[] {MediaColumns.OWNER_PACKAGE_NAME},
                     null, null)) {

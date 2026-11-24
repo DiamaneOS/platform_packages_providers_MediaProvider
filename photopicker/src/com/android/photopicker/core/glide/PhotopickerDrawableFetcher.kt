@@ -65,7 +65,7 @@ class PhotopickerDrawableFetcher(private val model: GlideLoadable, private val c
 
             var badgedIcon: Drawable? = null
 
-            // Another app's image is only loaded where the system's clean copy gate covers it: a system app.
+            // DiamaneOS: another app's image is only loaded where the system's clean copy gate covers it: a system app.
             if ((context.applicationInfo.flags and ApplicationInfo.FLAG_SYSTEM) == 0) {
                 callback.onLoadFailed(FileNotFoundException("Not a system app: $uri not loaded"))
                 return

@@ -827,6 +827,8 @@ public class MediaDocumentsProvider extends DocumentsProvider {
     public Cursor queryChildDocuments(String docId, String[] projection, String sortOrder)
             throws FileNotFoundException {
         enforceShellRestrictions();
+        // DiamaneOS: thumbnails of this user follow
+        com.android.providers.media.vmdecode.VmDecode.prepare();
         final ContentResolver resolver = getContext().getContentResolver();
         final MatrixCursor result = new MatrixCursor(resolveDocumentProjection(projection));
         final Ident ident = getIdentForDocId(docId);
@@ -944,6 +946,8 @@ public class MediaDocumentsProvider extends DocumentsProvider {
             @Nullable Bundle queryArgs, @Nullable CancellationSignal signal)
             throws FileNotFoundException {
         enforceShellRestrictions();
+        // DiamaneOS: thumbnails of this user follow
+        com.android.providers.media.vmdecode.VmDecode.prepare();
         final ContentResolver resolver = getContext().getContentResolver();
         final MatrixCursor result = new MatrixCursor(resolveDocumentProjection(projection));
 

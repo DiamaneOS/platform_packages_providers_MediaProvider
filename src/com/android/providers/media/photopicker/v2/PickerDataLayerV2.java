@@ -270,6 +270,8 @@ public class PickerDataLayerV2 {
      */
     @NonNull
     public static Cursor queryMedia(@NonNull Context appContext, @NonNull Bundle queryArgs) {
+        // DiamaneOS: the picker's thumbnails of this user follow
+        com.android.providers.media.vmdecode.VmDecode.prepare();
         final MediaQuery query = new MediaQuery(queryArgs);
         final PickerSyncController syncController = PickerSyncController.getInstanceOrThrow();
         final String effectiveLocalAuthority =
