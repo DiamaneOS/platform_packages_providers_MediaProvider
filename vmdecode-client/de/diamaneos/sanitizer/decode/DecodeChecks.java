@@ -25,10 +25,6 @@ package de.diamaneos.sanitizer.decode;
 public final class DecodeChecks {
     private DecodeChecks() {}
 
-    private static final long DAY = 86400000L;
-    private static final long MIN_DATE = -2208988800000L - DAY; // 1900-01-01, a day of slack
-    private static final long MAX_DATE = 253402300799999L + DAY; // 9999-12-31, a day of slack
-
     private static boolean status(int s) {
         return s == IDecodeService.STATUS_OK || s == IDecodeService.STATUS_UNAVAILABLE
                 || s == IDecodeService.STATUS_UNSUPPORTED || s == IDecodeService.STATUS_INVALID;
@@ -205,102 +201,5 @@ public final class DecodeChecks {
             }
         }
         return null;
-    }
-
-    /**
-     * A date taken in the future (more than a day ahead of this phone's clock) is not believed: the date and its
-     * offset are dropped and the rest of the record stays. A camera with a wrong clock, or this phone's own clock
-     * behind, gives such dates, so it is not a reason to refuse the record. Call before check.
-     */
-    public static void dropFutureDate(MetadataRecord m, long nowMillis) {
-        if (m != null && m.dateTakenMillis != -1 && m.dateTakenMillis > nowMillis + DAY) {
-            m.dateTakenMillis = -1;
-            m.offsetKnown = false;
-        }
-    }
-
-    /** The record's rules. A date in the future is not checked here (dropFutureDate), only its range. */
-    public static String check(MetadataRecord m, long nowMillis) {
-        if (m == null || !status(m.status)) return "status";
-        if (m.status != IDecodeService.STATUS_OK) return null;
-        if (!format(m.format)) return "format";
-        if (!size(m.width, m.height, IDecodeService.MAX_DIMENSION, IDecodeService.MAX_DIMENSION)) return "size";
-        if (m.orientation != -1 && m.orientation != 0 && m.orientation != 90 && m.orientation != 180
-                && m.orientation != 270) {
-            return "orientation";
-        }
-        if (m.dateTakenMillis == -1) {
-            if (m.offsetKnown) return "offset without date";
-        } else if (m.dateTakenMillis < MIN_DATE || m.dateTakenMillis > MAX_DATE) {
-            return "date";
-        }
-        boolean noLat = Double.isNaN(m.latitude), noLon = Double.isNaN(m.longitude);
-        if (noLat != noLon) return "position half absent";
-        if (!noLat && (m.latitude < -90 || m.latitude > 90 || m.longitude < -180 || m.longitude > 180)) {
-            return "position";
-        }
-        if (!text(m.description, IDecodeService.MAX_TEXT_CHARS)) return "description";
-        for (String n : new String[] {m.exposureTime, m.fNumber, m.iso, m.sceneCaptureType}) {
-            if (!number(n)) return "number";
-        }
-        for (String id : new String[] {m.documentId, m.instanceId, m.originalDocumentId}) {
-            if (!id(id)) return "identifier";
-        }
-        // GIF is always a GIF, an animated WebP is one, a motion photo is marked in its XMP (JPEG, PNG, WebP, HEIF,
-        // AVIF): the same rule as the service's own check (GuestLink).
-        boolean special = m.specialFormat == 0
-                || (m.specialFormat == 1 && m.format == IDecodeService.FORMAT_GIF)
-                || (m.specialFormat == 2 && (m.format == IDecodeService.FORMAT_JPEG
-                        || m.format == IDecodeService.FORMAT_PNG || m.format == IDecodeService.FORMAT_WEBP
-                        || m.format == IDecodeService.FORMAT_HEIF || m.format == IDecodeService.FORMAT_AVIF))
-                || (m.specialFormat == 3 && m.format == IDecodeService.FORMAT_WEBP);
-        if (!special) return "special format";
-        return null;
-    }
-
-    /**
-     * Printable text: no control characters (C0, DEL, C1), no line or paragraph separators, no bidi controls, no
-     * zero-width characters, no unpaired surrogates, at most max chars.
-     */
-    public static boolean text(String s, int max) {
-        if (s == null || s.length() > max) return false;
-        for (int i = 0; i < s.length(); i++) {
-            char c = s.charAt(i);
-            if (c < 0x20 || (c >= 0x7f && c <= 0x9f)) return false;
-            if (c == 0x2028 || c == 0x2029) return false;
-            if (c == 0x061c || c == 0x200e || c == 0x200f || (c >= 0x202a && c <= 0x202e)
-                    || (c >= 0x2066 && c <= 0x2069)) {
-                return false;
-            }
-            if (c == 0x180e || (c >= 0x200b && c <= 0x200d) || c == 0x2060 || c == 0xfeff) return false;
-            if (Character.isHighSurrogate(c)) {
-                if (i + 1 >= s.length() || !Character.isLowSurrogate(s.charAt(i + 1))) return false;
-                i++;
-            } else if (Character.isLowSurrogate(c)) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    public static boolean number(String s) {
-        if (s == null || s.length() > IDecodeService.MAX_NUMBER_CHARS) return false;
-        for (int i = 0; i < s.length(); i++) {
-            char c = s.charAt(i);
-            if (!((c >= '0' && c <= '9') || c == '.' || c == '/' || c == ' ')) return false;
-        }
-        return true;
-    }
-
-    public static boolean id(String s) {
-        if (s == null || s.length() > IDecodeService.MAX_ID_CHARS) return false;
-        for (int i = 0; i < s.length(); i++) {
-            char c = s.charAt(i);
-            if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == ':' || c == '.'
-                    || c == '-' || c == '_')) {
-                return false;
-            }
-        }
-        return true;
     }
 }
