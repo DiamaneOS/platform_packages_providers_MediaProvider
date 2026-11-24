@@ -77,9 +77,14 @@ public class SpecialFormatDetector {
      * caller stores nothing and asks again later.
      */
     public static int detect(File file, String owner) throws Exception {
-        try (FileInputStream is = new FileInputStream(file)) {
+        VmDecode.Info info = null;
+        try { info = VmDecode.probe(file, owner, VmDecode.PRIORITY_BACKGROUND); }
+        catch (IOException ignored) { }
+        try (com.android.providers.media.vmdecode.MetadataAdmission admission =
+                    VmDecode.metadataAdmission(owner);
+                FileInputStream is = new FileInputStream(file)) {
             final ExifInterface exif = new ExifInterface(is);
-            return detect(exif, file, owner);
+            return detect(exif, info);
         }
     }
 
@@ -107,7 +112,18 @@ public class SpecialFormatDetector {
         // The header is read in the decode service's VM, not here. Only a real answer is returned: unavailable or
         // unreadable throws, and the caller leaves the value unset to try again later, so a format the VM learns
         // later still gets its answer.
-        final VmDecode.Info info = VmDecode.probe(file, owner, VmDecode.PRIORITY_BACKGROUND);
+        return detectHeader(VmDecode.probe(file, owner, VmDecode.PRIORITY_BACKGROUND));
+    }
+
+    /** Uses an already checked header so parser admission never waits for another source job. */
+    public static int detect(ExifInterface exif, VmDecode.Info info) throws Exception {
+        if (isMotionPhoto(exif)) return FileColumns._SPECIAL_FORMAT_MOTION_PHOTO;
+        return detectHeader(info);
+    }
+
+    private static int detectHeader(VmDecode.Info info) throws IOException {
+        if (info == null) throw new com.android.providers.media.vmdecode.VmDecodeUnavailableException(
+                "No checked special-format header");
 
         if (info.isGif()) {
             return FileColumns._SPECIAL_FORMAT_GIF;
@@ -123,14 +139,17 @@ public class SpecialFormatDetector {
         if (!exif.hasAttribute(ExifInterface.TAG_XMP)) {
             return false;
         }
-        final String xmp = new String(exif.getAttributeBytes(ExifInterface.TAG_XMP),
-                StandardCharsets.UTF_8);
+        final byte[] raw = exif.getAttributeBytes(ExifInterface.TAG_XMP);
+        if (raw == null) return false;
+        // DiamaneOS: bound motion-photo XMP structure before tokenization.
+        final XmpMetadataBudget budget = new XmpMetadataBudget(raw);
+        final String xmp = new String(raw, StandardCharsets.UTF_8);
 
         // The below logic is copied from ExoPlayer#XmpMotionPhotoDescriptionParser class
         XmlPullParserFactory xmlPullParserFactory = XmlPullParserFactory.newInstance();
         XmlPullParser xpp = xmlPullParserFactory.newPullParser();
         xpp.setInput(new StringReader(xmp));
-        xpp.next();
+        budget.next(xpp);
         if (!isStartTag(xpp, XMP_META_TAG)) {
             Log.d(TAG, "Couldn't find xmp metadata");
             return false;
@@ -138,17 +157,17 @@ public class SpecialFormatDetector {
 
         Trace.beginSection("FormatDetector.motionPhotoDetectionUsingXpp");
         try {
-            return isMotionPhoto(xpp);
+            return isMotionPhoto(xpp, budget);
         } finally {
             Trace.endSection();
         }
     }
 
-    private static boolean isMotionPhoto(XmlPullParser xpp) throws Exception {
+    private static boolean isMotionPhoto(XmlPullParser xpp, XmpMetadataBudget budget) throws Exception {
         boolean isMotionPhotoAttributesFound = false;
 
         do {
-            xpp.next();
+            budget.next(xpp);
             if (!isStartTag(xpp)) {
                 continue;
             }
@@ -164,11 +183,11 @@ public class SpecialFormatDetector {
                     break;
                 case XMP_CONTAINER_DIRECTORY_PREFIX:
                     isMotionPhotoAttributesFound = isMotionPhotoDirectory(xpp, XMP_CONTAINER_PREFIX,
-                        XMP_ITEM_PREFIX);
+                        XMP_ITEM_PREFIX, budget);
                     break;
                 case XMP_GCONTAINER_DIRECTORY_PREFIX:
                     isMotionPhotoAttributesFound = isMotionPhotoDirectory(xpp,
-                            XMP_GCONTAINER_PREFIX, XMP_GCONTAINER_ITEM_PREFIX);
+                            XMP_GCONTAINER_PREFIX, XMP_GCONTAINER_ITEM_PREFIX, budget);
                     break;
                 default: // do nothing
             }
@@ -185,7 +204,7 @@ public class SpecialFormatDetector {
     }
 
     private static boolean isMotionPhotoDirectory(XmlPullParser xpp,
-            String containerNamespacePrefix, String itemNamespacePrefix)
+            String containerNamespacePrefix, String itemNamespacePrefix, XmpMetadataBudget budget)
             throws XmlPullParserException, IOException {
         final String itemTagName = containerNamespacePrefix + ":Item";
         final String directoryTagName = containerNamespacePrefix + ":Directory";
@@ -196,7 +215,7 @@ public class SpecialFormatDetector {
         boolean isMotionPhotoPresent = false;
 
         do {
-            xpp.next();
+            budget.next(xpp);
             if (!isStartTag(xpp, itemTagName)) {
                 continue;
             }

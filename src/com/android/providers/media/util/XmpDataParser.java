@@ -54,8 +54,11 @@ public final class XmpDataParser implements Closeable {
     private final long[] mXmpOffsets;
     private final ByteCountingInputStream mInput;
     private final XmlPullParser mParser;
+    private final XmpMetadataBudget mBudget;
 
     private XmpDataParser(byte[] rawXmp, long[] xmpOffsets) throws XmlPullParserException {
+        // DiamaneOS: bound input and XML traversal before parser work.
+        mBudget = new XmpMetadataBudget(rawXmp);
         mRawXmp = rawXmp;
         mXmpOffsets = xmpOffsets;
         mInput = new ByteCountingInputStream(new ByteArrayInputStream(rawXmp));
@@ -108,7 +111,7 @@ public final class XmpDataParser implements Closeable {
         long offset = 0;
         int type;
         XmpInterface.Builder builder = new XmpInterface.Builder(mRawXmp);
-        while ((type = mParser.next()) != END_DOCUMENT) {
+        while ((type = mBudget.next(mParser)) != END_DOCUMENT) {
             if (type != START_TAG) {
                 offset = mInput.getOffset(mParser);
                 continue;
@@ -141,7 +144,8 @@ public final class XmpDataParser implements Closeable {
             if (isSensitiveTagOrAttribute()) {
                 long start = offset;
                 do {
-                    type = mParser.next();
+                    type = mBudget.next(mParser);
+                    if (type == END_DOCUMENT) throw new XmlPullParserException("Unclosed XMP tag");
                 } while (type != END_TAG || !mParser.getName().equals(name));
                 offset = mInput.getOffset(mParser);
 
@@ -193,7 +197,7 @@ public final class XmpDataParser implements Closeable {
         long offset = 0;
         int type;
         LongArray redactedRanges = new LongArray();
-        while ((type = mParser.next()) != END_DOCUMENT) {
+        while ((type = mBudget.next(mParser)) != END_DOCUMENT) {
             if (type != START_TAG) {
                 offset = mInput.getOffset(mParser);
                 continue;
@@ -206,7 +210,8 @@ public final class XmpDataParser implements Closeable {
             if (isSensitiveTagOrAttribute()) {
                 long start = offset;
                 do {
-                    type = mParser.next();
+                    type = mBudget.next(mParser);
+                    if (type == END_DOCUMENT) throw new XmlPullParserException("Unclosed XMP tag");
                 } while (type != END_TAG || !mParser.getName().equals(name));
                 offset = mInput.getOffset(mParser);
 

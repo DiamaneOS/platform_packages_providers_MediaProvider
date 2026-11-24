@@ -313,6 +313,10 @@ public final class VmDecode {
         return sourceUser() + ":" + (packageName == null ? "" : packageName);
     }
 
+    public static MetadataAdmission metadataAdmission(String packageName) {
+        return SourceReader.metadataAdmission(principal(packageName));
+    }
+
     public interface MetadataWork<T> { T run() throws IOException; }
 
     /** Metadata and source preparation share admission, cancellation and the remaining row deadline. */

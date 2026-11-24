@@ -220,8 +220,12 @@ final class SourceReader {
         sCancel.execute(signal::cancel);
     }
 
+    static MetadataAdmission metadataAdmission(String principal) {
+        return new MetadataAdmission(sBudget, principal);
+    }
+
     static <T> T metadata(String principal, long timeout, SourceWork.Work<T> work) throws IOException {
-        return SourceWork.call(sIo, sBudget, principal, 32L * 1024 * 1024, timeout, work, value -> { });
+        return SourceWork.call(sIo, sBudget, principal, MetadataAdmission.BYTES, timeout, work, value -> { });
     }
 
     static final class Prepared implements AutoCloseable {

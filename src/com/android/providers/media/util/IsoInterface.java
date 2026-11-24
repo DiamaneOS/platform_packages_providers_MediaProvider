@@ -17,16 +17,12 @@
 package com.android.providers.media.util;
 
 import android.media.ExifInterface;
-import android.system.ErrnoException;
-import android.system.Os;
-import android.system.OsConstants;
 import android.util.Log;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.annotation.VisibleForTesting;
 
-import java.io.EOFException;
 import java.io.File;
 import java.io.FileDescriptor;
 import java.io.FileInputStream;
@@ -67,7 +63,7 @@ public class IsoInterface {
     /**
      * Test if given box type is a well-known parent box type.
      */
-    private static boolean isBoxParent(int type) {
+    static boolean isBoxParent(int type) {
         switch (type) {
             case 0x6d6f6f76: // moov
             case 0x6d6f6f66: // moof
@@ -97,7 +93,7 @@ public class IsoInterface {
     /** Flattened view of some boxes */
     private final List<Box> mFlattened = new ArrayList<>();
 
-    private static class Box {
+    static class Box {
         public final int type;
         public long[] range;
         public UUID uuid;
@@ -117,164 +113,9 @@ public class IsoInterface {
         return new String(buf);
     }
 
-    private static int readInt(@NonNull FileDescriptor fd)
-            throws ErrnoException, IOException {
-        final byte[] buf = new byte[4];
-        if (Os.read(fd, buf, 0, 4) == 4) {
-            return Memory.peekInt(buf, 0, ByteOrder.BIG_ENDIAN);
-        } else {
-            throw new EOFException();
-        }
-    }
-
-    private static @NonNull UUID readUuid(@NonNull FileDescriptor fd)
-            throws ErrnoException, IOException {
-        final long high = (((long) readInt(fd)) << 32L) | (((long) readInt(fd)) & 0xffffffffL);
-        final long low = (((long) readInt(fd)) << 32L) | (((long) readInt(fd)) & 0xffffffffL);
-        return new UUID(high, low);
-    }
-
-    private static @Nullable byte[] allocateBuffer(int type, int size) {
-        try {
-            if (size > MAX_XMP_SIZE_BYTES) {
-                Log.w(TAG, "Iso box(" + type + ") data size is too large: " + size);
-                return null;
-            }
-            return new byte[size];
-        } catch (OutOfMemoryError e) {
-            Log.w(TAG, "Couldn't read large box(" + type + "), size: " + size, e);
-            return null;
-        }
-    }
-
-    private static boolean parseNextBox(@NonNull List<Box> flatten, @NonNull FileDescriptor fd,
-            long end, int parentType, @NonNull String prefix) throws ErrnoException, IOException {
-        final long pos = Os.lseek(fd, 0, OsConstants.SEEK_CUR);
-
-        int headerSize = 8;
-        if (end - pos < headerSize) {
-            return false;
-        }
-
-        long len = Integer.toUnsignedLong(readInt(fd));
-        final int type = readInt(fd);
-
-        if (len == 0) {
-            // Length 0 means the box extends to the end of the file.
-            len = end - pos;
-        } else if (len == 1) {
-            // Actually 64-bit box length.
-            headerSize += 8;
-            long high = readInt(fd);
-            long low = readInt(fd);
-            len = (high << 32L) | (low & 0xffffffffL);
-        }
-
-        if (len < headerSize || pos + len > end) {
-            Log.w(TAG, "Invalid box at " + pos + " of length " + len
-                    + ". End of parent " + end);
-            return false;
-        }
-
-        final Box box = new Box(type, new long[] { pos, len });
-        box.headerSize = headerSize;
-
-        // Parse UUID box
-        if (type == BOX_UUID) {
-            box.headerSize += 16;
-            box.uuid = readUuid(fd);
-            if (LOGV) {
-                Log.v(TAG, prefix + "  UUID " + box.uuid);
-            }
-
-            if (Objects.equals(box.uuid, XMP_UUID)) {
-                box.data = allocateBuffer(type, (int) (len - box.headerSize));
-                if (box.data != null) {
-                    Os.read(fd, box.data, 0, box.data.length);
-                }
-            }
-        } else if (type == BOX_XMP) {
-            box.data = allocateBuffer(type, (int) (len - box.headerSize));
-            if (box.data != null) {
-                Os.read(fd, box.data, 0, box.data.length);
-            }
-        } else if (type == BOX_META && len != headerSize) {
-            // The format of this differs in ISO and QT encoding:
-            // (iso) [1 byte version + 3 bytes flags][4 byte size of next atom]
-            // (qt)  [4 byte size of next atom      ][4 byte hdlr atom type   ]
-            // In case of (iso) we need to skip the next 4 bytes before parsing
-            // the children.
-            readInt(fd);
-            int maybeBoxType = readInt(fd);
-            if (maybeBoxType != BOX_HDLR) {
-                // ISO, skip 4 bytes.
-                box.headerSize += 4;
-            }
-            Os.lseek(fd, pos + box.headerSize, OsConstants.SEEK_SET);
-        } else if (type == BOX_XYZ && parentType == BOX_ILST) {
-            box.range = new long[] {box.range[0], headerSize,
-                    box.range[0] + headerSize, box.range[1] - headerSize};
-        }
-
-        if (LOGV) {
-            Log.v(TAG, prefix + "Found box " + typeToString(type)
-                    + " at " + pos + " hdr " + box.headerSize + " length " + len);
-        }
-
-        switch (type) {
-            case BOX_UUID:
-                if (!Objects.equals(box.uuid, XMP_UUID)) break;
-            // fall through
-            case BOX_META:
-            case BOX_HDLR:
-            case BOX_XYZ:
-            case BOX_XMP:
-            case BOX_LOCI:
-            case BOX_GPS:
-            case BOX_GPS0:
-                flatten.add(box);
-                break;
-        }
-
-        // Recursively parse any children boxes
-        if (isBoxParent(type)) {
-            //noinspection StatementWithEmptyBody
-            while (parseNextBox(flatten, fd, pos + len, type, prefix + "  ")) {}
-        }
-
-        // Skip completely over ourselves
-        Os.lseek(fd, pos + len, OsConstants.SEEK_SET);
-        return true;
-    }
-
     private IsoInterface(@NonNull FileDescriptor fd) throws IOException {
-        try {
-            Os.lseek(fd, 4, OsConstants.SEEK_SET);
-            boolean hasFtypHeader;
-            try {
-                hasFtypHeader = readInt(fd) == BOX_FTYP;
-            } catch (EOFException e) {
-                hasFtypHeader = false;
-            }
-
-            if (!hasFtypHeader) {
-                if (LOGV) {
-                    Log.w(TAG, "Missing 'ftyp' header");
-                }
-                return;
-            }
-
-            final long end = Os.lseek(fd, 0, OsConstants.SEEK_END);
-            Os.lseek(fd, 0, OsConstants.SEEK_SET);
-
-            //noinspection StatementWithEmptyBody
-            while (parseNextBox(mFlattened, fd, end, -1, "")) {}
-        } catch (ErrnoException e) {
-            throw e.rethrowAsIOException();
-        } catch (OutOfMemoryError e) {
-            Log.e(TAG, "Too many boxes in file. This might imply a corrupted file.", e);
-            throw new IOException(e.getMessage());
-        }
+        // DiamaneOS: bound traversal and retained metadata for the whole file.
+        mFlattened.addAll(IsoMetadataReader.read(fd));
     }
 
     public static @NonNull IsoInterface fromFile(@NonNull File file)
