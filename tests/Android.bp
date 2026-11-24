@@ -304,3 +304,14 @@ filegroup {
         "src/com/android/providers/media/library/RunOnlyOnPostsubmit.java",
     ],
 }
+
+// DiamaneOS: a distinct provider UID for the bounded picker authorization regression.
+android_test_helper_app {
+    name: "MediaProviderSlowCloudFixture",
+    manifest: "vm_slow_cloud/AndroidManifest.xml",
+    srcs: ["vm_slow_cloud/src/**/*.java"],
+    libs: ["framework-mediaprovider.impl"],
+    platform_apis: true,
+    certificate: "media",
+    min_sdk_version: "36",
+}

@@ -23,7 +23,10 @@ import com.bumptech.glide.Registry;
 import com.bumptech.glide.annotation.GlideModule;
 import com.bumptech.glide.module.AppGlideModule;
 
-import java.io.InputStream;
+import com.android.providers.media.vmdecode.frames.PickerImage;
+import com.bumptech.glide.GlideBuilder;
+import com.bumptech.glide.request.RequestOptions;
+import com.bumptech.glide.load.engine.DiskCacheStrategy;
 
 /**
  * Custom glide module to enable the loading of thumbnails from cloud media provider.
@@ -34,10 +37,16 @@ public class PickerGlideModule extends AppGlideModule {
     @Override
     public void registerComponents(Context context, Glide glide, Registry registry) {
         registry.append(
-                GlideLoadable.class, InputStream.class, new PickerModelLoaderFactory(context));
-        // DiamaneOS: an animation made in the decode service's VM (VmFrames), before any decoder that would read
-        // image bytes. It never decodes an image file.
-        registry.prepend(InputStream.class, android.graphics.drawable.Drawable.class,
-                new com.android.providers.media.vmdecode.frames.VmFrames.Decoder(context.getResources()));
+                GlideLoadable.class, PickerImage.class, new PickerModelLoaderFactory(context));
+        // DiamaneOS: checked pixels keep colour and HDR data through the final resource.
+        registry.prepend(PickerImage.class, android.graphics.Bitmap.class, new PickerImage.BitmapDecoder());
+        registry.prepend(PickerImage.class, android.graphics.drawable.Drawable.class,
+                new PickerImage.DrawableDecoder(context.getResources()));
+    }
+
+    @Override
+    public void applyOptions(Context context, GlideBuilder builder) {
+        // DiamaneOS: encoded disk caches cannot preserve the complete checked pixel resource.
+        builder.setDefaultRequestOptions(new RequestOptions().diskCacheStrategy(DiskCacheStrategy.NONE));
     }
 }

@@ -20,7 +20,7 @@ import android.content.ContentResolver
 import com.bumptech.glide.load.Options
 import com.bumptech.glide.load.model.ModelLoader
 import com.bumptech.glide.load.model.ModelLoader.LoadData
-import java.io.InputStream
+import com.android.providers.media.vmdecode.frames.PickerImage
 
 /**
  * Loader class that is responsible for assembling the components and data to kick off a load of a
@@ -31,7 +31,7 @@ import java.io.InputStream
  */
 class PhotopickerModelLoader(
     val contentResolver: ContentResolver,
-) : ModelLoader<GlideLoadable, InputStream> {
+) : ModelLoader<GlideLoadable, PickerImage> {
 
     /**
      * This assembles a cache signature for storing the resulting bytes, and instantiates a worker
@@ -43,9 +43,9 @@ class PhotopickerModelLoader(
         width: Int,
         height: Int,
         options: Options
-    ): LoadData<InputStream> {
+    ): LoadData<PickerImage> {
         return LoadData(
-            model.getSignature(Resolution.THUMBNAIL),
+            com.bumptech.glide.signature.ObjectKey("vm_pixels_v2_" + model.getSignature(Resolution.THUMBNAIL)),
             PhotopickerMediaFetcher(contentResolver, model, width, height, options)
         )
     }

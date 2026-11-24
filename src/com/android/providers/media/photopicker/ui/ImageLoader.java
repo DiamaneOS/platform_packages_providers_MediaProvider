@@ -129,8 +129,7 @@ public class ImageLoader {
                     imageView);
             return;
         }
-        // Every other preview is a still image: the picker's fetcher hands Glide a PNG made from pixels decoded
-        // in the decode service's VM, never the original bytes.
+        // DiamaneOS: still previews retain the checked bitmap through the display resource.
         loadWithGlide(
                 getBitmapRequestBuilder(loadable),
                 /* requestOptions */ null,
@@ -179,7 +178,8 @@ public class ImageLoader {
         }
         requestOptionsWithPreferredColorSpace.set(PREFERRED_COLOR_SPACE, mPreferredColorSpace);
 
-        newRequestBuilder = newRequestBuilder.apply(requestOptionsWithPreferredColorSpace);
+        // DiamaneOS: ImageView applies its scale type while drawing the complete checked bitmap.
+        newRequestBuilder = newRequestBuilder.apply(requestOptionsWithPreferredColorSpace).dontTransform();
 
         if (signature != null) {
             newRequestBuilder = newRequestBuilder.signature(signature);

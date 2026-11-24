@@ -21,6 +21,7 @@ import android.graphics.drawable.Drawable
 import androidx.compose.foundation.layout.defaultMinSize
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.unit.dp
 import com.bumptech.glide.RequestBuilder
 import com.bumptech.glide.integration.compose.ExperimentalGlideComposeApi
@@ -55,16 +56,18 @@ fun loadMedia(
     GlideImage(
         model = media,
         contentDescription = contentDescription,
+        // DiamaneOS: crop at draw time so checked colour and HDR metadata stay on the bitmap.
+        contentScale = if (requestBuilderTransformation == null) ContentScale.Crop else ContentScale.Fit,
         // Always explicitly provide a default width and height to avoid cannot measure errors in
         // headless tests. These default minimums are only overridden when the incoming
         // corresponding constraint is 0, if a smaller size is specified, that will be used.
         modifier = modifier.defaultMinSize(minWidth = 1.dp, minHeight = 1.dp),
     ) {
-        requestBuilderTransformation?.invoke(media, resolution, it)
+        (requestBuilderTransformation?.invoke(media, resolution, it)
             // If no RequestBuilder function was provided, then apply the loadable signature to
             // ensure the cache is populated.
             ?: it.set(RESOLUTION_REQUESTED, resolution)
-                .centerCrop()
-                .signature(media.getSignature(resolution))
+                .signature(media.getSignature(resolution)))
+            .dontTransform()
     }
 }

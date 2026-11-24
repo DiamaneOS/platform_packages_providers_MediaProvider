@@ -28,10 +28,10 @@ import com.bumptech.glide.load.Options;
 import com.bumptech.glide.load.model.ModelLoader;
 import com.bumptech.glide.signature.ObjectKey;
 
-import java.io.InputStream;
+import com.android.providers.media.vmdecode.frames.PickerImage;
 
 /** Custom {@link ModelLoader} to load thumbnails from cloud media provider. */
-public final class PickerModelLoader implements ModelLoader<GlideLoadable, InputStream> {
+public final class PickerModelLoader implements ModelLoader<GlideLoadable, PickerImage> {
     private final Context mContext;
 
     PickerModelLoader(Context context) {
@@ -39,13 +39,13 @@ public final class PickerModelLoader implements ModelLoader<GlideLoadable, Input
     }
 
     @Override
-    public LoadData<InputStream> buildLoadData(
+    public LoadData<PickerImage> buildLoadData(
             GlideLoadable model, int width, int height, Options options) {
         final boolean isThumbRequest = Boolean.TRUE.equals(options.get(THUMBNAIL_REQUEST));
         // DiamaneOS: a GIF or animated WebP preview asks for all frames (VmFrames), cached apart from the still.
         final boolean animate = Boolean.TRUE.equals(options.get(VmFrames.ANIMATE));
         return new LoadData<>(
-                new ObjectKey(model.getLoadableSignature(/* prefix= */ animate ? "frames_" : null)),
+                new ObjectKey(model.getLoadableSignature(/* prefix= */ animate ? "vm_pixels_v2_frames_" : "vm_pixels_v2_")),
                 new PickerThumbnailFetcher(mContext, model, width, height, isThumbRequest, animate));
     }
 

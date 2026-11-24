@@ -22,13 +22,13 @@ import com.bumptech.glide.load.model.ModelLoader;
 import com.bumptech.glide.load.model.ModelLoaderFactory;
 import com.bumptech.glide.load.model.MultiModelLoaderFactory;
 
-import java.io.InputStream;
+import com.android.providers.media.vmdecode.frames.PickerImage;
 
 /**
  * Custom {@link ModelLoaderFactory} which provides a {@link ModelLoader} for loading thumbnails
  * from cloud media provider.
  */
-public class PickerModelLoaderFactory implements ModelLoaderFactory<GlideLoadable, InputStream> {
+public class PickerModelLoaderFactory implements ModelLoaderFactory<GlideLoadable, PickerImage> {
 
     private final Context mContext;
 
@@ -37,7 +37,7 @@ public class PickerModelLoaderFactory implements ModelLoaderFactory<GlideLoadabl
     }
 
     @Override
-    public ModelLoader<GlideLoadable, InputStream> build(MultiModelLoaderFactory unused) {
+    public ModelLoader<GlideLoadable, PickerImage> build(MultiModelLoaderFactory unused) {
         return new PickerModelLoader(mContext);
     }
 

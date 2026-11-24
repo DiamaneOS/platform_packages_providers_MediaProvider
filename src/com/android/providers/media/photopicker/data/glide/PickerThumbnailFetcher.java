@@ -18,200 +18,64 @@ package com.android.providers.media.photopicker.data.glide;
 
 import android.content.ContentResolver;
 import android.content.Context;
-import android.content.res.AssetFileDescriptor;
-import android.graphics.Bitmap;
 import android.graphics.Point;
 import android.os.Bundle;
-import android.os.CancellationSignal;
-import android.os.SystemClock;
 import android.provider.CloudMediaProviderContract;
-import android.provider.MediaStore;
-import android.util.DisplayMetrics;
-import android.util.Log;
-
-import androidx.annotation.Nullable;
-
-import com.android.providers.media.vmdecode.VmDecode;
-import com.android.providers.media.vmdecode.VmDecodeUnavailableException;
-
+import com.android.providers.media.vmdecode.frames.PickerImage;
+import com.android.providers.media.vmdecode.frames.PickerImageClient;
 import com.bumptech.glide.Priority;
 import com.bumptech.glide.load.DataSource;
 import com.bumptech.glide.load.data.DataFetcher;
-
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
-import java.io.FileNotFoundException;
 import java.io.IOException;
-import java.io.InputStream;
 
-/**
- * Custom {@link DataFetcher} to fetch a {@link InputStream} for a thumbnail from a cloud media
- * provider.
- */
-public class PickerThumbnailFetcher implements DataFetcher<InputStream> {
-
-    private static final String TAG = "PickerThumbnailFetcher";
+/** Fetches checked pixels through the selected profile's MediaProvider. */
+public class PickerThumbnailFetcher implements DataFetcher<PickerImage> {
     private final Context mContext;
     private final GlideLoadable mModel;
     private final int mWidth;
     private final int mHeight;
     private final boolean mIsThumbRequest;
     private final boolean mAnimate;
-    private final CancellationSignal mCancellationSignal;
-    @Nullable private AssetFileDescriptor mAssetFileDescriptor = null;
-    @Nullable private InputStream mInputStream = null;
+    private final PickerImageClient mClient = new PickerImageClient();
+    private PickerImage mImage;
 
-    PickerThumbnailFetcher(
-            Context context, GlideLoadable model, int width, int height, boolean isThumbRequest,
-            boolean animate) {
+    PickerThumbnailFetcher(Context context, GlideLoadable model, int width, int height,
+            boolean isThumbRequest, boolean animate) {
         mContext = context;
         mModel = model;
         mWidth = width;
         mHeight = height;
         mIsThumbRequest = isThumbRequest;
         mAnimate = animate;
-        mCancellationSignal = new CancellationSignal();
     }
-
-    // DiamaneOS: a tile that could not be made because the decode service did not answer (here, or in MediaProvider's
-    // own thumbnail, which comes back as a FileNotFoundException with the same message) is tried again while it is
-    // wanted: at once when the service answers or connects anew, else after a wait that doubles, at most this long.
-    private static final long RETRY_FOR_MS = 60_000;
-    private static final long FIRST_RETRY_MS = 2_000;
 
     @Override
-    public void loadData(Priority priority, DataCallback<? super InputStream> callback) {
-        // The picker's own process decodes in the VM too, its client is set up here.
-        VmDecode.init(mContext);
-        final long end = SystemClock.uptimeMillis() + RETRY_FOR_MS;
-        long wait = FIRST_RETRY_MS;
-        while (true) {
-            final int mark = VmDecode.answersMark();
-            try {
-                loadOnce(callback);
-                return;
-            } catch (IOException e) {
-                if (!VmDecodeUnavailableException.isUnavailable(e)) {
-                    // Not the decode service's: a missing or unreadable item fails as before.
-                    callback.onLoadFailed(e);
-                    return;
-                }
-                final long left = end - SystemClock.uptimeMillis();
-                closeQuietly();
-                if (left <= 0 || mCancellationSignal.isCanceled()) {
-                    callback.onLoadFailed(e);
-                    return;
-                }
-                VmDecode.awaitAnswer(mark, Math.min(wait, left), mCancellationSignal);
-                wait *= 2;
-                if (mCancellationSignal.isCanceled()) {
-                    callback.onLoadFailed(e);
-                    return;
-                }
-            }
-        }
-    }
-
-    private void closeQuietly() {
+    public void loadData(Priority priority, DataCallback<? super PickerImage> callback) {
+        final Bundle options = new Bundle();
+        options.putParcelable(ContentResolver.EXTRA_SIZE, new Point(mWidth, mHeight));
+        options.putBoolean(CloudMediaProviderContract.EXTRA_MEDIASTORE_THUMB, mIsThumbRequest);
+        options.putString(PickerImageClient.MIME, "image/*");
+        options.putBoolean(PickerImageClient.FRAMES, mAnimate);
         try {
-            if (mAssetFileDescriptor != null) {
-                mAssetFileDescriptor.close();
-            }
-        } catch (IOException ignored) {
-            // Closed.
+            mImage = mClient.load(mContext.getContentResolver(), mModel.getLoadableUri(), options);
+            callback.onDataReady(mImage);
+        } catch (IOException e) {
+            callback.onLoadFailed(e);
         }
-        mAssetFileDescriptor = null;
     }
 
-    private void loadOnce(DataCallback<? super InputStream> callback) throws IOException {
-        ContentResolver contentResolver = mContext.getContentResolver();
-        final Bundle opts = new Bundle();
-        opts.putParcelable(ContentResolver.EXTRA_SIZE, new Point(mWidth, mHeight));
-        opts.putBoolean(CloudMediaProviderContract.EXTRA_PREVIEW_THUMBNAIL, true);
-
-        if (mIsThumbRequest) {
-            opts.putBoolean(CloudMediaProviderContract.EXTRA_MEDIASTORE_THUMB, true);
-        }
-
-        // Do not close the afd or InputStream as it will close the input stream. The
-        // afd needs to be closed when cleanup is called, so save a reference so it can
-        // be closed when Glide is done with it.
-        mAssetFileDescriptor =
-                contentResolver.openTypedAssetFileDescriptor(
-                        mModel.getLoadableUri(),
-                        /* mimeType= */ "image/*",
-                        opts,
-                        /* cancellationSignal= */ mCancellationSignal);
-        if (mAssetFileDescriptor == null) {
-            final String err = "Failed to load data for " + mModel;
-            callback.onLoadFailed(new FileNotFoundException(err));
-            return;
-        }
-        // The bytes may come from another app (a cloud media provider) or from any file. They are
-        // decoded only in the decode service's VM, and Glide gets a PNG made here from the checked
-        // pixels. Unavailable or undecodable fails the load: Glide never sees the original bytes.
-        final DisplayMetrics metrics = mContext.getResources().getDisplayMetrics();
-        final int screen = Math.max(metrics.widthPixels, metrics.heightPixels);
-        final int maxWidth = mWidth > 0 ? mWidth : screen;
-        final int maxHeight = mHeight > 0 ? mHeight : screen;
-        // The descriptor goes to the decode service as it is: a provider that stalls or never ends is
-        // read by the service under its own deadline, never by a thread here.
-        final String owner = VmDecode.pickerOwner(mContext, mModel.getLoadableUri());
-        if (mAnimate) {
-            // A GIF or animated WebP preview: every frame made in the VM, played by VmFrames' drawable.
-            final VmDecode.Animation a = VmDecode.decodeAssetAnimation(mAssetFileDescriptor, owner,
-                    VmDecode.PRIORITY_USER_WAITING, maxWidth, maxHeight, mCancellationSignal);
-            mInputStream = new ByteArrayInputStream(a.encoded);
-            callback.onDataReady(mInputStream);
-            return;
-        }
-        final Bitmap bitmap = VmDecode.decodeAsset(mAssetFileDescriptor, owner,
-                VmDecode.PRIORITY_USER_WAITING, maxWidth, maxHeight, mCancellationSignal);
-        final ByteArrayOutputStream png = new ByteArrayOutputStream();
-        bitmap.compress(Bitmap.CompressFormat.PNG, 100, png);
-        bitmap.recycle();
-        mInputStream = new ByteArrayInputStream(png.toByteArray());
-        callback.onDataReady(mInputStream);
-    }
-
-    /**
-     * Cleanup is called after Glide is done with this Fetcher instance, and it is now safe to close
-     * the remembered AssetFileDescriptor.
-     */
     @Override
     public void cleanup() {
-        try {
-            if (mInputStream != null) {
-                mInputStream.close();
-            }
-
-            if (mAssetFileDescriptor != null) {
-                mAssetFileDescriptor.close();
-            }
-        } catch (IOException e) {
-            Log.d(TAG, "Unexpected error during thumbnail request cleanup.", e);
+        mClient.close();
+        if (mImage != null) {
+            try { mImage.close(); } catch (IOException ignored) { }
         }
     }
 
     @Override
-    public void cancel() {
-        mCancellationSignal.cancel();
-    }
-
+    public void cancel() { mClient.close(); }
     @Override
-    public Class<InputStream> getDataClass() {
-        return InputStream.class;
-    }
-
+    public Class<PickerImage> getDataClass() { return PickerImage.class; }
     @Override
-    public DataSource getDataSource() {
-        // If the authority belongs to MediaProvider, we can consider this a local load.
-        if (mModel.getLoadableUri().getAuthority().equals(MediaStore.AUTHORITY)) {
-            return DataSource.LOCAL;
-        } else {
-            // Otherwise, let's assume it's a Remote data source so that Glide will cache
-            // the raw return value rather than manipulated bytes.
-            return DataSource.REMOTE;
-        }
-    }
+    public DataSource getDataSource() { return DataSource.LOCAL; }
 }

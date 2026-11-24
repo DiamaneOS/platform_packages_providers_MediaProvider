@@ -19,141 +19,63 @@ package com.android.photopicker.core.glide
 import android.content.ContentResolver
 import android.graphics.Point
 import android.os.Bundle
-import android.os.ParcelFileDescriptor
 import android.provider.CloudMediaProviderContract
-import android.provider.MediaStore
 import android.provider.MediaStore.Files.FileColumns._SPECIAL_FORMAT_ANIMATED_WEBP
 import android.provider.MediaStore.Files.FileColumns._SPECIAL_FORMAT_GIF
-import android.util.Log
 import com.android.photopicker.data.model.Media
+import com.android.providers.media.vmdecode.frames.PickerImage
+import com.android.providers.media.vmdecode.frames.PickerImageClient
 import com.bumptech.glide.Priority
 import com.bumptech.glide.load.DataSource
 import com.bumptech.glide.load.Options
 import com.bumptech.glide.load.data.DataFetcher
-import com.bumptech.glide.load.data.DataFetcher.DataCallback
-import java.io.FileNotFoundException
 import java.io.IOException
-import java.io.InputStream
 
-/**
- * The worker unit of the [GlideLoadable] pipeline.
- *
- * Each load receives its own worker which is responsible for fetching data related to that specific
- * load operation.
- *
- * @property resolver The [ContentResolver] that will be used for fetching.
- * @property model The model this worker is responsible for loading.
- * @property width The requested width of the image.
- * @property height The requested height of the image.
- * @property options Any additional loading options.
- */
+/** Fetches typed checked pixels from the media item's profile, with cancellation and bounded retry. */
 class PhotopickerMediaFetcher(
     private val resolver: ContentResolver,
     private val model: GlideLoadable,
     private val width: Int,
     private val height: Int,
     private val options: Options,
-) : DataFetcher<InputStream> {
-
+) : DataFetcher<PickerImage> {
     companion object {
-        val TAG: String = "PhotopickerMediaFetcher"
-
-        // DiamaneOS: MediaProvider decodes the picker's images in the decode service's protected VM
-        // and writes a PNG of the checked pixels into a pipe, so Glide here only ever decodes that PNG,
-        // never an item's own bytes. The names are MediaProvider's (vmdecode/VmDecode.java).
-        const val PICKER_IMAGE_CALL = "de.diamaneos.vmdecode.picker_image"
-        const val EXTRA_PICKER_IMAGE_OUT = "de.diamaneos.vmdecode.picker_image_out"
-        const val EXTRA_PICKER_IMAGE_MIME = "de.diamaneos.vmdecode.picker_image_mime"
-        // A preview of a GIF or an animated WebP: all frames, made in the VM (VmFrames), instead of a still image.
-        const val EXTRA_PICKER_IMAGE_FRAMES = "de.diamaneos.vmdecode.picker_image_frames"
+        const val PICKER_IMAGE_CALL = PickerImageClient.METHOD
+        const val EXTRA_PICKER_IMAGE_OUT = PickerImageClient.OUT
+        const val EXTRA_PICKER_IMAGE_MIME = PickerImageClient.MIME
+        const val EXTRA_PICKER_IMAGE_FRAMES = PickerImageClient.FRAMES
     }
+    private val client = PickerImageClient()
+    private var image: PickerImage? = null
 
-    // The read end of the pipe MediaProvider writes the image into, held open for Glide and closed
-    // during [cleanup] or [cancel].
-    @Volatile private var inputStream: InputStream? = null
-
-    /**
-     * The load request that is issued by Glide so this worker can begin to load it's data. The
-     * callback should be used to notify Glide of the outcome.
-     */
-    override fun loadData(priority: Priority, callback: DataCallback<in InputStream>) {
-        val pipe = ParcelFileDescriptor.createReliablePipe()
-        try {
-            val extras =
-                Bundle().apply {
-                    putParcelable(ContentResolver.EXTRA_SIZE, Point(width, height))
-                    if (options.get(RESOLUTION_REQUESTED)?.equals(Resolution.THUMBNAIL) ?: false) {
-                        putBoolean(CloudMediaProviderContract.EXTRA_MEDIASTORE_THUMB, true)
-                    }
-                    putString(EXTRA_PICKER_IMAGE_MIME, model.getMimeTypeForGlide())
-                    if (animated()) {
-                        putBoolean(EXTRA_PICKER_IMAGE_FRAMES, true)
-                    }
-                    putParcelable(EXTRA_PICKER_IMAGE_OUT, pipe[1])
-                }
-            // The MediaProvider of the item's user (content://<user>@<authority>/...), which accepts only
-            // items of its own user. Returns at once: it writes the image, or closes the pipe with an error.
-            val uri = model.getLoadableUri()
-            val authority = uri.userInfo?.let { "$it@${MediaStore.AUTHORITY}" } ?: MediaStore.AUTHORITY
-            resolver.call(
-                authority,
-                PICKER_IMAGE_CALL,
-                model.getLoadableUri().toString(),
-                extras,
-            )
-        } catch (ex: RuntimeException) {
-            pipe[0].close()
-            callback.onLoadFailed(
-                FileNotFoundException("Failed to load data for ${model.getLoadableUri()}: $ex")
-            )
-            return
-        } finally {
-            pipe[1].close()
+    override fun loadData(priority: Priority, callback: DataFetcher.DataCallback<in PickerImage>) {
+        val extras = Bundle().apply {
+            putParcelable(ContentResolver.EXTRA_SIZE, Point(width, height))
+            putBoolean(CloudMediaProviderContract.EXTRA_MEDIASTORE_THUMB,
+                options.get(RESOLUTION_REQUESTED) == Resolution.THUMBNAIL)
+            putString(PickerImageClient.MIME, model.getMimeTypeForGlide())
+            putBoolean(PickerImageClient.FRAMES, animated())
         }
-        val stream = ParcelFileDescriptor.AutoCloseInputStream(pipe[0])
-        inputStream = stream
-        callback.onDataReady(stream)
+        try {
+            image = client.load(resolver, model.getLoadableUri(), extras)
+            callback.onDataReady(image)
+        } catch (failure: IOException) {
+            callback.onLoadFailed(failure)
+        }
     }
 
-    /**
-     * Glide will call this when the resources this worker holds are no longer needed, so they can
-     * be safely closed.
-     */
-    /** A full-size request for a GIF or an animated WebP, which the picker plays as before. */
     private fun animated(): Boolean {
-        val image = model as? Media.Image ?: return false
-        val full = options.get(RESOLUTION_REQUESTED)?.equals(Resolution.FULL) ?: false
-        return full &&
-            (image.standardMimeTypeExtension == _SPECIAL_FORMAT_GIF ||
-                image.standardMimeTypeExtension == _SPECIAL_FORMAT_ANIMATED_WEBP)
+        val media = model as? Media.Image ?: return false
+        return options.get(RESOLUTION_REQUESTED) == Resolution.FULL &&
+            (media.standardMimeTypeExtension == _SPECIAL_FORMAT_GIF ||
+                media.standardMimeTypeExtension == _SPECIAL_FORMAT_ANIMATED_WEBP)
     }
 
     override fun cleanup() {
-        try {
-            inputStream?.close()
-        } catch (ex: IOException) {
-            Log.d(TAG, "Unexpected error during media fetcher cleanup", ex)
-        }
+        client.close()
+        try { image?.close() } catch (_: IOException) { }
     }
-
-    /**
-     * If this load hasn't been completed, and is no longer needed, Glide will request a
-     * cancellation here. (Maybe the image is no longer in view, etc..)
-     */
-    override fun cancel() {
-        // MediaProvider's write then fails and it stops.
-        try {
-            inputStream?.close()
-        } catch (ex: IOException) {
-            Log.d(TAG, "Unexpected error during media fetcher cancel", ex)
-        }
-    }
-
-    override fun getDataClass(): Class<InputStream> {
-        return InputStream::class.java
-    }
-
-    override fun getDataSource(): DataSource {
-        return model.getDataSource()
-    }
+    override fun cancel() { client.close() }
+    override fun getDataClass(): Class<PickerImage> = PickerImage::class.java
+    override fun getDataSource(): DataSource = DataSource.LOCAL
 }
