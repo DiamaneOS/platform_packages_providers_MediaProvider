@@ -89,6 +89,10 @@ android_app {
     sdk_version: "module_current",
     min_sdk_version: "30",
 
+    aidl: {
+        local_include_dirs: ["vmdecode-aidl"],
+    },
+
     certificate: "media",
     privileged: true,
     privapp_allowlist: ":privapp_allowlist_com.android.providers.media.module.xml",
@@ -124,7 +128,33 @@ filegroup {
         "src/**/*.aidl",
         "src/**/*.java",
         ":statslog-mediaprovider-java-gen",
+        ":mediaprovider-vmdecode-aidl",
+        ":mediaprovider-vmdecode-client",
+        ":mediaprovider-vmdecode-frames",
     ],
+}
+
+// The decode service's API (de.diamaneos.sanitizer, IDecodeService). An exact copy of the decode service's files
+// (packages/apps/DiamaneOSSanitizer), whose build rule decode_api_copies_check fails when they differ.
+filegroup {
+    name: "mediaprovider-vmdecode-aidl",
+    srcs: ["vmdecode-aidl/**/*.aidl"],
+    path: "vmdecode-aidl",
+}
+
+// The callers' checks of the decode service's replies (DecodeChecks), an exact copy of the decode service's
+// de.diamaneos.sanitizer.decode-client library, checked by the same build rule. MediaProvider links that library
+// instead once the decode service is in the tree.
+filegroup {
+    name: "mediaprovider-vmdecode-client",
+    srcs: ["vmdecode-client/**/*.java"],
+}
+
+// Animations from the decode service on their way to the pickers' Glide (VmFrames), shared by MediaProvider's picker
+// and the photo picker app.
+filegroup {
+    name: "mediaprovider-vmdecode-frames",
+    srcs: ["vmdecode-frames/**/*.java"],
 }
 
 // This is defined to give LegacyMediaProvider the bare minimum it needs

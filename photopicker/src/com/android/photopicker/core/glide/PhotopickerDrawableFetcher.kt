@@ -17,6 +17,7 @@
 package com.android.photopicker.core.glide
 
 import android.content.Context
+import android.content.pm.ApplicationInfo
 import android.graphics.drawable.Drawable
 import android.os.UserHandle
 import android.util.Log
@@ -67,6 +68,19 @@ class PhotopickerDrawableFetcher(private val model: GlideLoadable, private val c
             packageName?.let {
                 val contextForPackage =
                     context.createPackageContextAsUser(packageName, 0, userHandle)
+                // DiamaneOS: image files of an app outside the system image (a cloud media
+                // provider's icon) would be decoded in this process. Only icons of the verified
+                // system image load here, the others are not shown.
+                val info = contextForPackage.applicationInfo
+                if (
+                    info.flags and ApplicationInfo.FLAG_SYSTEM == 0 ||
+                        info.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP != 0
+                ) {
+                    callback.onLoadFailed(
+                        FileNotFoundException("Icon of $packageName is not from the system image")
+                    )
+                    return
+                }
                 val icon = contextForPackage.getDrawable(resourceId)
                 icon?.let {
                     badgedIcon = context.packageManager.getUserBadgedIcon(icon, userHandle)

@@ -244,10 +244,8 @@ import android.database.MatrixCursor;
 import android.database.sqlite.SQLiteConstraintException;
 import android.database.sqlite.SQLiteDatabase;
 import android.graphics.Bitmap;
-import android.graphics.BitmapFactory;
 import android.graphics.drawable.Icon;
 import android.icu.util.ULocale;
-import android.media.ThumbnailUtils;
 import android.mtp.MtpConstants;
 import android.net.Uri;
 import android.os.Binder;
@@ -344,6 +342,9 @@ import com.android.providers.media.scan.MediaScanner;
 import com.android.providers.media.scan.MediaScanner.ScanReason;
 import com.android.providers.media.scan.ModernMediaScanner;
 import com.android.providers.media.stableuris.dao.BackupIdRow;
+import com.android.providers.media.vmdecode.VmDecode;
+import com.android.providers.media.vmdecode.VmDecodeRejectedException;
+import com.android.providers.media.vmdecode.VmDecodeUnavailableException;
 import com.android.providers.media.util.CachedSupplier;
 import com.android.providers.media.util.DatabaseUtils;
 import com.android.providers.media.util.ExpiredItemsUtils;
@@ -1688,6 +1689,9 @@ public class MediaProvider extends ContentProvider {
         final int thumbSize = Math.min(metrics.widthPixels, metrics.heightPixels) / 2;
         mThumbSize = new Size(thumbSize, thumbSize);
 
+        // Images are decoded only in the protected VM of the decode service, never in this process.
+        VmDecode.init(context);
+
         mConfigStore = createConfigStore();
         mDatabaseBackupAndRecovery = createDatabaseBackupAndRecovery();
 
@@ -2247,19 +2251,26 @@ public class MediaProvider extends ContentProvider {
         // This is to ensure we only do a bounded iteration over the rows as updates can fail, and
         // we don't want to keep running the query/update indefinitely.
         final int totalRowsToUpdate = getPendingSpecialFormatRowsCount(db, signal);
+        // Rows the decode service could not answer stay NULL. Walking in id order past them keeps them from
+        // hiding the rest, and each run tries them once more.
+        long afterId = -1;
         for (int i = 0; i < totalRowsToUpdate; i += IDLE_MAINTENANCE_ROWS_LIMIT) {
             try (PickerDbFacade.UpdateMediaOperation operation =
                          mPickerDbFacade.beginUpdateMediaOperation(
                                  PickerSyncController.LOCAL_PICKER_PROVIDER_AUTHORITY)) {
-                updateSpecialFormatForLimitedRows(db, signal, operation);
+                afterId = updateSpecialFormatForLimitedRows(db, signal, operation, afterId);
                 operation.setSuccess();
+            }
+            if (afterId < 0) {
+                break;
             }
         }
     }
 
     private int getPendingSpecialFormatRowsCount(SQLiteDatabase db,
             @NonNull CancellationSignal signal) {
-        try (Cursor c = queryForPendingSpecialFormatColumns(db, /* limit */ null, signal)) {
+        try (Cursor c = queryForPendingSpecialFormatColumns(db, /* limit */ null, /* afterId */ -1,
+                signal)) {
             if (c == null) {
                 return 0;
             }
@@ -2267,16 +2278,32 @@ public class MediaProvider extends ContentProvider {
         }
     }
 
-    private void updateSpecialFormatForLimitedRows(SQLiteDatabase externalDb,
-            @NonNull CancellationSignal signal, PickerDbFacade.UpdateMediaOperation operation) {
+    /** Returns the last id it looked at, or -1 when no rows were left after {@code afterId}. */
+    private long updateSpecialFormatForLimitedRows(SQLiteDatabase externalDb,
+            @NonNull CancellationSignal signal, PickerDbFacade.UpdateMediaOperation operation,
+            long afterId) {
         // Accumulate all the new SPECIAL_FORMAT updates with their ids
         ArrayMap<Long, Integer> newSpecialFormatValues = new ArrayMap<>();
         final String limit = String.valueOf(IDLE_MAINTENANCE_ROWS_LIMIT);
-        try (Cursor c = queryForPendingSpecialFormatColumns(externalDb, limit, signal)) {
+        ArrayMap<Long, String> pathsWithoutSize = new ArrayMap<>();
+        ArrayMap<Long, String> owners = new ArrayMap<>();
+        long lastId = -1;
+        try (Cursor c = queryForPendingSpecialFormatColumns(externalDb, limit, afterId, signal)) {
             while (c.moveToNext() && !signal.isCanceled()) {
                 final long id = c.getLong(0);
                 final String path = c.getString(1);
-                newSpecialFormatValues.put(id, getSpecialFormatValue(path));
+                final String owner = c.getString(3);
+                lastId = id;
+                final Integer specialFormat = getSpecialFormatValue(path, owner);
+                if (specialFormat == null) {
+                    // No real answer from the decode service: stays NULL, tried again next run.
+                    continue;
+                }
+                newSpecialFormatValues.put(id, specialFormat);
+                owners.put(id, owner);
+                if (c.isNull(2)) {
+                    pathsWithoutSize.put(id, path);
+                }
             }
         }
 
@@ -2286,7 +2313,7 @@ public class MediaProvider extends ContentProvider {
         int count = 0;
         for (long id : newSpecialFormatValues.keySet()) {
             if (signal.isCanceled()) {
-                return;
+                return -1;
             }
 
             int specialFormat = newSpecialFormatValues.get(id);
@@ -2297,6 +2324,19 @@ public class MediaProvider extends ContentProvider {
 
             externalDbValues.clear();
             externalDbValues.put(_SPECIAL_FORMAT, specialFormat);
+            final String pathWithoutSize = pathsWithoutSize.get(id);
+            if (pathWithoutSize != null) {
+                try {
+                    final VmDecode.Info info = VmDecode.probe(new File(pathWithoutSize),
+                            owners.get(id), VmDecode.PRIORITY_BACKGROUND);
+                    externalDbValues.put(MediaColumns.WIDTH, info.width);
+                    externalDbValues.put(MediaColumns.HEIGHT, info.height);
+                    externalDbValues.put(MediaColumns.RESOLUTION,
+                            info.width + "\u00d7" + info.height);
+                } catch (IOException e) {
+                    Log.w(TAG, "No image size for " + pathWithoutSize + ": " + e.getMessage());
+                }
+            }
             final String externalDbSelection = MediaColumns._ID + "=?";
             final String[] externalDbSelectionArgs = new String[]{String.valueOf(id)};
             boolean externalDbWriteSuccess =
@@ -2309,9 +2349,14 @@ public class MediaProvider extends ContentProvider {
             }
         }
         Log.d(TAG, "Updated standard_mime_type_extension for " + count + " items");
+        return lastId;
     }
 
-    private int getSpecialFormatValue(String path) {
+    /**
+     * The special format of an image, or null when the decode service gave no real answer (unavailable, or the VM
+     * could not read the file): the row stays NULL and is tried again later.
+     */
+    private Integer getSpecialFormatValue(String path, @Nullable String owner) {
         final File file = new File(path);
         if (!file.exists()) {
             // We always update special format to none if the file is not found or there is an
@@ -2320,7 +2365,10 @@ public class MediaProvider extends ContentProvider {
         }
 
         try {
-            return SpecialFormatDetector.detect(file);
+            return SpecialFormatDetector.detect(file, owner);
+        } catch (VmDecodeUnavailableException | VmDecodeRejectedException e) {
+            Log.d(TAG, "Special format later, no answer from the decode service: " + e.getMessage());
+            return null;
         } catch (Exception e) {
             // we tried our best, no need to run special detection again and again if it
             // throws exception once, it is likely to do so everytime.
@@ -2330,13 +2378,15 @@ public class MediaProvider extends ContentProvider {
     }
 
     private Cursor queryForPendingSpecialFormatColumns(SQLiteDatabase db, String limit,
-            @NonNull CancellationSignal signal) {
+            long afterId, @NonNull CancellationSignal signal) {
         // Run special detection for images only
         final String selection = _SPECIAL_FORMAT + " IS NULL AND "
-                + MEDIA_TYPE + "=" + MEDIA_TYPE_IMAGE;
-        final String[] projection = new String[] { MediaColumns._ID, MediaColumns.DATA };
-        return db.query(/* distinct */ true, "files", projection, selection, null, null, null,
-                null, limit, signal);
+                + MEDIA_TYPE + "=" + MEDIA_TYPE_IMAGE + " AND " + MediaColumns._ID + ">?";
+        final String[] projection = new String[] { MediaColumns._ID, MediaColumns.DATA,
+                MediaColumns.WIDTH, MediaColumns.OWNER_PACKAGE_NAME };
+        return db.query(/* distinct */ true, "files", projection, selection,
+                new String[] { String.valueOf(afterId) }, null, null, MediaColumns._ID, limit,
+                signal);
     }
 
     /**
@@ -7961,6 +8011,13 @@ public class MediaProvider extends ContentProvider {
             case MediaStore.GET_CLOUD_PROVIDER_LABEL_CALL: {
                 return getResultForGetCloudProviderLabel();
             }
+            case VmDecode.PICKER_IMAGE_CALL: {
+                // DiamaneOS: the photo picker app's images, decoded in the decode service's VM.
+                if (!isCallerPhotoPicker()) {
+                    throw new SecurityException(getSecurityExceptionMessage("PICKER_IMAGE_CALL"));
+                }
+                return VmDecode.pickerImage(getContext(), arg, extras);
+            }
             case MediaStore.GET_CLOUD_PROVIDER_DETAILS: {
                 if (isCallerPhotoPicker()) {
                     return PickerDataLayerV2.getCloudProviderDetails(extras);
@@ -9938,24 +9995,24 @@ public class MediaProvider extends ContentProvider {
     private final Thumbnailer mAudioThumbnailer = new Thumbnailer(Environment.DIRECTORY_MUSIC) {
         @Override
         public Bitmap getThumbnailBitmap(Uri uri, CancellationSignal signal) throws IOException {
-            return ThumbnailUtils.createAudioThumbnail(queryForDataFile(uri, signal),
-                    mThumbSize, signal);
+            return VmDecode.audioThumbnail(queryForDataFile(uri, signal), mThumbSize,
+                    queryForOwnerPackage(uri, signal), signal);
         }
     };
 
     private final Thumbnailer mVideoThumbnailer = new Thumbnailer(Environment.DIRECTORY_MOVIES) {
         @Override
         public Bitmap getThumbnailBitmap(Uri uri, CancellationSignal signal) throws IOException {
-            return ThumbnailUtils.createVideoThumbnail(queryForDataFile(uri, signal),
-                    mThumbSize, signal);
+            return VmDecode.videoThumbnail(queryForDataFile(uri, signal), mThumbSize,
+                    queryForOwnerPackage(uri, signal), signal);
         }
     };
 
     private final Thumbnailer mImageThumbnailer = new Thumbnailer(Environment.DIRECTORY_PICTURES) {
         @Override
         public Bitmap getThumbnailBitmap(Uri uri, CancellationSignal signal) throws IOException {
-            return ThumbnailUtils.createImageThumbnail(queryForDataFile(uri, signal),
-                    mThumbSize, signal);
+            return VmDecode.imageThumbnail(queryForDataFile(uri, signal), mThumbSize,
+                    queryForOwnerPackage(uri, signal), signal);
         }
     };
 
@@ -11435,12 +11492,16 @@ public class MediaProvider extends ContentProvider {
      * by reading data from the underlying image.
      */
     private void updateImageMetadata(ContentValues values, File file) {
-        final BitmapFactory.Options bitmapOpts = new BitmapFactory.Options();
-        bitmapOpts.inJustDecodeBounds = true;
-        BitmapFactory.decodeFile(file.getAbsolutePath(), bitmapOpts);
-
-        values.put(MediaColumns.WIDTH, bitmapOpts.outWidth);
-        values.put(MediaColumns.HEIGHT, bitmapOpts.outHeight);
+        // The header is read in the decode service's VM. Without it the size stays unknown here and the scanner or
+        // idle maintenance fills it in later.
+        try {
+            final VmDecode.Info info = VmDecode.probe(file, getCallingPackageOrSelf(),
+                    VmDecode.PRIORITY_BACKGROUND);
+            values.put(MediaColumns.WIDTH, info.width);
+            values.put(MediaColumns.HEIGHT, info.height);
+        } catch (IOException e) {
+            Log.w(TAG, "No image size for " + file + ": " + e.getMessage());
+        }
     }
 
     private void handleInsertedRowForFuse(long rowId) {
@@ -11510,6 +11571,20 @@ public class MediaProvider extends ContentProvider {
             } else {
                 return new File(data);
             }
+        }
+    }
+
+    /**
+     * Return the {@link MediaColumns#OWNER_PACKAGE_NAME} of the given {@code Uri}, or null. The decode service queues
+     * work per owner, so one app's files cannot hold up everyone else's.
+     */
+    @Nullable
+    String queryForOwnerPackage(Uri uri, CancellationSignal signal) {
+        try (Cursor cursor = queryForSingleItem(uri, new String[] { MediaColumns.OWNER_PACKAGE_NAME },
+                null, null, signal)) {
+            return cursor.getString(0);
+        } catch (FileNotFoundException | RuntimeException e) {
+            return null;
         }
     }
 

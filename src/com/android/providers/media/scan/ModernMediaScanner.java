@@ -79,7 +79,6 @@ import android.database.sqlite.SQLiteBlobTooBigException;
 import android.database.sqlite.SQLiteDatabase;
 import android.drm.DrmManagerClient;
 import android.drm.DrmSupportInfo;
-import android.graphics.BitmapFactory;
 import android.media.ExifInterface;
 import android.media.MediaMetadataRetriever;
 import android.mtp.MtpConstants;
@@ -133,6 +132,9 @@ import com.android.providers.media.util.Metrics;
 import com.android.providers.media.util.MimeUtils;
 import com.android.providers.media.util.SpecialFormatDetector;
 import com.android.providers.media.util.XmpDataParser;
+import com.android.providers.media.vmdecode.VmDecode;
+import com.android.providers.media.vmdecode.VmDecodeRejectedException;
+import com.android.providers.media.vmdecode.VmDecodeUnavailableException;
 import com.android.providers.media.util.XmpInterface;
 
 import org.json.JSONObject;
@@ -183,6 +185,9 @@ import java.util.regex.Pattern;
  * {@link XmpInterface}, each with increasing levels of trust.
  */
 public class ModernMediaScanner implements MediaScanner {
+    /** The owner package of the file being scanned on this thread, for the decode service's fair queue. */
+    private static final ThreadLocal<String> sScanOwner = new ThreadLocal<>();
+
     private static final String TAG = "ModernMediaScanner";
     private static final boolean LOGW = Log.isLoggable(TAG, Log.WARN);
     private static final boolean LOGD = Log.isLoggable(TAG, Log.DEBUG);
@@ -973,7 +978,10 @@ public class ModernMediaScanner implements MediaScanner {
             queryArgs.putInt(MediaStore.QUERY_ARG_MATCH_FAVORITE, MediaStore.MATCH_INCLUDE);
             final String[] projection = new String[] {FileColumns._ID, FileColumns.DATE_MODIFIED,
                     FileColumns.SIZE, FileColumns.MIME_TYPE, FileColumns.MEDIA_TYPE,
-                    FileColumns.IS_PENDING, FileColumns._MODIFIER};
+                    FileColumns.IS_PENDING, FileColumns._MODIFIER, FileColumns.OWNER_PACKAGE_NAME};
+            // The app that supplied the bytes, for the decode service's fair queue: the row's owner, or the
+            // package an Android/media path belongs to.
+            String scanOwner = FileUtils.extractPathOwnerPackageName(realFile.getAbsolutePath());
 
             final Matcher matcher = FileUtils.PATTERN_EXPIRES_FILE.matcher(realFile.getName());
             // If IS_PENDING is set by FUSE, we should scan the file and update IS_PENDING to zero.
@@ -984,6 +992,9 @@ public class ModernMediaScanner implements MediaScanner {
             try (Cursor c = mResolver.query(mFilesUri, projection, queryArgs, mSignal)) {
                 if (c.moveToFirst()) {
                     existingId = c.getLong(0);
+                    if (!c.isNull(7)) {
+                        scanOwner = c.getString(7);
+                    }
                     final String mimeType = c.getString(3);
                     final int mediaType = c.getInt(4);
                     isPendingFromFuse &= c.getInt(5) != 0;
@@ -1041,10 +1052,12 @@ public class ModernMediaScanner implements MediaScanner {
 
             final ContentProviderOperation.Builder op;
             Trace.beginSection("Scanner.scanItem");
+            sScanOwner.set(scanOwner);
             try {
                 op = scanItem(existingId, realFile, attrs, actualMimeType, actualMediaType,
                         mVolumeName, mRestoreExecutorOptional.orElse(null));
             } finally {
+                sScanOwner.remove();
                 Trace.endSection();
             }
             if (op != null) {
@@ -1566,15 +1579,21 @@ public class ModernMediaScanner implements MediaScanner {
     private void withBitmapResolutionValues(
             @NonNull ContentProviderOperation.Builder op,
             @NonNull File file) {
-        final BitmapFactory.Options bitmapOptions = new BitmapFactory.Options();
-        bitmapOptions.inSampleSize = 1;
-        bitmapOptions.inJustDecodeBounds = true;
-        bitmapOptions.outWidth = 0;
-        bitmapOptions.outHeight = 0;
-        BitmapFactory.decodeFile(file.getAbsolutePath(), bitmapOptions);
+        // The header is read in the decode service's VM. When it is unavailable the size stays unset, and idle
+        // maintenance fills it in together with the special format.
+        int outWidth = 0;
+        int outHeight = 0;
+        try {
+            final VmDecode.Info info = VmDecode.probe(file, sScanOwner.get(),
+                    VmDecode.PRIORITY_BACKGROUND);
+            outWidth = info.width;
+            outHeight = info.height;
+        } catch (IOException e) {
+            Log.w(TAG, "No image size for " + file + ": " + e.getMessage());
+        }
 
-        final Optional<?> width = parseOptionalOrZero(bitmapOptions.outWidth);
-        final Optional<?> height = parseOptionalOrZero(bitmapOptions.outHeight);
+        final Optional<?> width = parseOptionalOrZero(outWidth);
+        final Optional<?> height = parseOptionalOrZero(outHeight);
         withOptionalValue(op, MediaColumns.WIDTH, width);
         withOptionalValue(op, MediaColumns.HEIGHT, height);
         withOptionalValue(op, MediaColumns.RESOLUTION, parseOptionalResolution(width, height));
@@ -1797,7 +1816,14 @@ public class ModernMediaScanner implements MediaScanner {
             final XmpInterface xmp = XmpDataParser.createXmpInterface(exif);
             withXmpValues(op, xmp, mimeType);
 
-            op.withValue(FileColumns._SPECIAL_FORMAT, SpecialFormatDetector.detect(exif, file));
+            try {
+                op.withValue(FileColumns._SPECIAL_FORMAT,
+                        SpecialFormatDetector.detect(exif, file, sScanOwner.get()));
+            } catch (VmDecodeUnavailableException | VmDecodeRejectedException e) {
+                // Only real answers are stored. NULL makes idle maintenance try again, also once the VM
+                // reads a format it cannot read today.
+                op.withValue(FileColumns._SPECIAL_FORMAT, null);
+            }
         } catch (Exception e) {
             logTroubleScanning(file, e);
         }

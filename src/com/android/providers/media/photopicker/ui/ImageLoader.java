@@ -33,11 +33,12 @@ import com.android.providers.media.photopicker.data.glide.GlideLoadable;
 import com.android.providers.media.photopicker.data.model.Category;
 import com.android.providers.media.photopicker.data.model.Item;
 
+import com.android.providers.media.vmdecode.frames.VmFrames;
+
 import com.bumptech.glide.Glide;
 import com.bumptech.glide.RequestBuilder;
 import com.bumptech.glide.load.Option;
 import com.bumptech.glide.load.PreferredColorSpace;
-import com.bumptech.glide.load.resource.gif.GifDrawable;
 import com.bumptech.glide.request.RequestOptions;
 import com.bumptech.glide.signature.ObjectKey;
 
@@ -118,25 +119,18 @@ public class ImageLoader {
      */
     public void loadImagePreview(@NonNull Item item, @NonNull ImageView imageView)  {
         final GlideLoadable loadable = item.toGlideLoadable();
-        if (item.isGif()) {
+        if (item.isGifOrAnimatedWebp()) {
+            // A GIF or animated WebP plays: its frames are made in the decode service's VM and Glide gets them as
+            // checked pixels (VmFrames), never the original bytes.
             loadWithGlide(
-                    getGifRequestBuilder(loadable),
+                    getDrawableRequestBuilder(loadable).set(VmFrames.ANIMATE, true),
                     /* requestOptions */ null,
-                    getGlideSignature(loadable, /* prefix= */ PREVIEW_PREFIX),
+                    getGlideSignature(loadable, /* prefix= */ PREVIEW_PREFIX + "frames_"),
                     imageView);
             return;
         }
-
-        if (item.isAnimatedWebp()) {
-            loadWithGlide(
-                    getDrawableRequestBuilder(loadable),
-                    /* requestOptions */ null,
-                    getGlideSignature(loadable, PREVIEW_PREFIX),
-                    imageView);
-            return;
-        }
-
-        // Preview as bitmap image for all other image types
+        // Every other preview is a still image: the picker's fetcher hands Glide a PNG made from pixels decoded
+        // in the decode service's VM, never the original bytes.
         loadWithGlide(
                 getBitmapRequestBuilder(loadable),
                 /* requestOptions */ null,
@@ -164,12 +158,6 @@ public class ImageLoader {
     private RequestBuilder<Bitmap> getBitmapRequestBuilder(GlideLoadable loadable) {
         return Glide.with(mContext)
                 .asBitmap()
-                .load(loadable);
-    }
-
-    private RequestBuilder<GifDrawable> getGifRequestBuilder(GlideLoadable loadable) {
-        return Glide.with(mContext)
-                .asGif()
                 .load(loadable);
     }
 

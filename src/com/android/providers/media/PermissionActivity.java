@@ -47,13 +47,13 @@ import android.content.Intent;
 import android.content.pm.ApplicationInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.PackageManager.NameNotFoundException;
+import android.content.res.AssetFileDescriptor;
 import android.content.res.Configuration;
 import android.content.res.Resources;
 import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.graphics.ImageDecoder;
-import android.graphics.ImageDecoder.ImageInfo;
-import android.graphics.ImageDecoder.Source;
+import android.graphics.Point;
 import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Icon;
 import android.net.Uri;
@@ -67,7 +67,6 @@ import android.provider.MediaStore.MediaColumns;
 import android.text.TextUtils;
 import android.util.DisplayMetrics;
 import android.util.Log;
-import android.util.Size;
 import android.view.KeyEvent;
 import android.view.View;
 import android.view.ViewGroup;
@@ -84,9 +83,11 @@ import androidx.annotation.VisibleForTesting;
 import androidx.appcompat.widget.AppCompatTextView;
 
 import com.android.modules.utils.build.SdkLevel;
+import com.android.providers.media.vmdecode.VmDecode;
 import com.android.providers.media.util.Metrics;
 import com.android.providers.media.util.StringUtils;
 
+import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -1031,6 +1032,16 @@ public class PermissionActivity extends Activity {
         public static final int LOAD_THUMBNAIL = 1 << 1;
         public static final int LOAD_FULL = 1 << 2;
 
+        /** The owner package of a media item, or null. */
+        private static String queryOwner(ContentResolver resolver, Uri uri) {
+            try (Cursor c = resolver.query(uri, new String[] {MediaColumns.OWNER_PACKAGE_NAME},
+                    null, null)) {
+                return c != null && c.moveToFirst() ? c.getString(0) : null;
+            } catch (RuntimeException e) {
+                return null;
+            }
+        }
+
         public Description(Context context, Uri uri, int loadFlags) {
             final Resources res = context.getResources();
             final ContentResolver resolver = context.getContentResolver();
@@ -1046,18 +1057,39 @@ public class PermissionActivity extends Activity {
                         }
                     }
                 }
+                // Nothing is decoded in this process. An image is decoded from the file in the decode
+                // service's VM. Video and audio previews are MediaProvider's thumbnails, made as before
+                // (a video frame in the media sandbox, embedded pictures in the VM), and their thumbnail
+                // bytes are decoded in the VM too. When the service is unavailable the IOException below
+                // shows the type icon instead.
+                VmDecode.init(context);
+                final String mimeType = resolver.getType(uri);
+                final boolean image = mimeType != null && mimeType.startsWith("image/");
+                final String owner = queryOwner(resolver, uri);
                 if ((loadFlags & LOAD_THUMBNAIL) != 0) {
-                    final Size size = new Size(res.getDisplayMetrics().widthPixels,
-                            res.getDisplayMetrics().widthPixels);
-                    thumbnail = resolver.loadThumbnail(uri, size, null);
+                    final int side = res.getDisplayMetrics().widthPixels;
+                    if (image) {
+                        thumbnail = VmDecode.decodeForDisplay(resolver, uri, owner, side, side);
+                    } else {
+                        final Bundle opts = new Bundle();
+                        opts.putParcelable(ContentResolver.EXTRA_SIZE, new Point(side, side));
+                        try (AssetFileDescriptor asset = resolver.openTypedAssetFileDescriptor(uri,
+                                "image/*", opts, null)) {
+                            if (asset == null) {
+                                throw new FileNotFoundException("no thumbnail for " + uri);
+                            }
+                            thumbnail = VmDecode.decodeAsset(asset, owner,
+                                    VmDecode.PRIORITY_USER_WAITING, side, side, null);
+                        }
+                    }
                 }
                 if ((loadFlags & LOAD_FULL) != 0) {
                     // Only offer full decodes when a supported file type;
                     // otherwise fall back to using thumbnail
-                    final String mimeType = resolver.getType(uri);
-                    if (ImageDecoder.isMimeTypeSupported(mimeType)) {
-                        full = ImageDecoder.decodeBitmap(ImageDecoder.createSource(resolver, uri),
-                                new Resizer(context.getResources().getDisplayMetrics()));
+                    if (image && ImageDecoder.isMimeTypeSupported(mimeType)) {
+                        final DisplayMetrics metrics = context.getResources().getDisplayMetrics();
+                        final int maxSize = Math.max(metrics.widthPixels, metrics.heightPixels);
+                        full = VmDecode.decodeForDisplay(resolver, uri, owner, maxSize, maxSize);
                     } else {
                         full = thumbnail;
                     }
@@ -1098,30 +1130,6 @@ public class PermissionActivity extends Activity {
             imageView.setContentDescription(contentDescription);
             imageView.setVisibility(View.VISIBLE);
             imageView.setClipToOutline(true);
-        }
-    }
-
-    /**
-     * Utility that will speed up decoding of large images, since we never need
-     * them to be larger than the screen dimensions.
-     */
-    private static class Resizer implements ImageDecoder.OnHeaderDecodedListener {
-        private final int maxSize;
-
-        public Resizer(DisplayMetrics metrics) {
-            this.maxSize = Math.max(metrics.widthPixels, metrics.heightPixels);
-        }
-
-        @Override
-        public void onHeaderDecoded(ImageDecoder decoder, ImageInfo info, Source source) {
-            // We requested a rough thumbnail size, but the remote size may have
-            // returned something giant, so defensively scale down as needed.
-            final int widthSample = info.getSize().getWidth() / maxSize;
-            final int heightSample = info.getSize().getHeight() / maxSize;
-            final int sample = Math.max(widthSample, heightSample);
-            if (sample > 1) {
-                decoder.setTargetSampleSize(sample);
-            }
         }
     }
 }
