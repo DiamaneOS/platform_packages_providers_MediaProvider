@@ -84,8 +84,9 @@ final class PickerImages {
             close(out);
         };
         // DiamaneOS: local checks retain capacity while cloud permission calls are held.
-        final boolean local = com.android.providers.media.photopicker.PickerSyncController
-                .LOCAL_PICKER_PROVIDER_AUTHORITY.equals(uri.getHost());
+        final boolean local;
+        try { local = ProviderAuthority.localPicker(uri); }
+        catch (SecurityException invalid) { denied.run(); return new Bundle(); }
         PickerAuthorization.submit(local, () -> providerUid(context, uri),
                 () -> VmDecode.checkPickerUri(context, uri, callerPid, callerUid), () -> {
                     if (readerGone(out) || android.os.SystemClock.uptimeMillis() >= end) {
@@ -103,10 +104,11 @@ final class PickerImages {
     private static int providerUid(Context context, Uri uri) {
         final int user = VmMediaRows.uriUser(context, uri);
         if (!VmMediaUsers.serves(context, user)) throw new SecurityException("Unserved picker user");
+        final String authority = ProviderAuthority.picker(uri);
         if (com.android.providers.media.photopicker.PickerSyncController.LOCAL_PICKER_PROVIDER_AUTHORITY
-                .equals(uri.getHost())) return android.os.Process.myUid();
+                .equals(authority)) return android.os.Process.myUid();
         final android.content.pm.ProviderInfo provider = VmMediaUsers.contextForUser(context, user)
-                .getPackageManager().resolveContentProvider(uri.getHost(), 0);
+                .getPackageManager().resolveContentProvider(authority, 0);
         return provider == null || provider.applicationInfo == null ? -1 : provider.applicationInfo.uid;
     }
 
@@ -163,6 +165,8 @@ final class PickerImages {
         } catch (VmDecodeRejectedException e) {
             answer(receiver, e.verdict ? PickerImageClient.REJECTED : PickerImageClient.LATER,
                     "Picker image refused");
+        } catch (VmMediaGoneException e) {
+            answer(receiver, PickerImageClient.GONE, "Picker item no longer exists");
         } catch (IOException e) {
             answer(receiver, PickerImageClient.LATER, "Picker image temporarily unavailable");
         } catch (RuntimeException | OutOfMemoryError e) {

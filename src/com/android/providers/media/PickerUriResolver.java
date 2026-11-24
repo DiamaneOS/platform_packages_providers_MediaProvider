@@ -50,6 +50,7 @@ import android.os.ParcelFileDescriptor;
 import android.os.Process;
 import android.os.UserHandle;
 import android.provider.CloudMediaProviderContract;
+import android.provider.DocumentsContract;
 import android.provider.MediaStore;
 import android.util.Log;
 
@@ -59,13 +60,16 @@ import androidx.annotation.VisibleForTesting;
 
 import com.android.modules.utils.build.SdkLevel;
 import com.android.providers.media.photopicker.PickerDataLayer;
+import com.android.providers.media.photopicker.PickerSyncController;
 import com.android.providers.media.photopicker.data.PickerDbFacade;
 import com.android.providers.media.photopicker.data.model.UserId;
 import com.android.providers.media.photopicker.metrics.NonUiEventLogger;
 import com.android.providers.media.util.PermissionUtils;
+import com.android.providers.media.vmdecode.VmMediaRows;
 
 import java.io.File;
 import java.io.FileNotFoundException;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
@@ -648,9 +652,35 @@ private static final LocalUriMatcher sStaticUriMatcher =
         newOpts.putBoolean(CloudMediaProviderContract.EXTRA_MEDIASTORE_THUMB, true);
 
         final Uri unwrappedUri = unwrapProviderUri(uri, false);
+        final String authority = unwrappedUri.getAuthority();
+        final int sourceUser = getUserId(uri);
+        // DiamaneOS: the granted picker path selects the resolver and the source user.
+        if (sourceUser < 0 || authority == null || authority.indexOf('@') >= 0) {
+            throw new FileNotFoundException("Invalid picker thumbnail source");
+        }
         final long  callingIdentity = Binder.clearCallingIdentity();
         try {
-            return resolver.openTypedAssetFile(unwrappedUri, mimeTypeFilter, newOpts, signal);
+            final AssetFileDescriptor asset =
+                    resolver.openTypedAssetFile(unwrappedUri, mimeTypeFilter, newOpts, signal);
+            if (asset == null || PickerSyncController.LOCAL_PICKER_PROVIDER_AUTHORITY.equals(authority)) {
+                return asset;
+            }
+            try {
+                final Bundle extras = new Bundle();
+                final Bundle forwarded = asset.getExtras();
+                if (forwarded != null && forwarded.containsKey(DocumentsContract.EXTRA_ORIENTATION)) {
+                    extras.putInt(DocumentsContract.EXTRA_ORIENTATION,
+                            forwarded.getInt(DocumentsContract.EXTRA_ORIENTATION));
+                }
+                extras.putInt(VmMediaRows.MEDIA_USER, sourceUser);
+                return new AssetFileDescriptor(asset.getParcelFileDescriptor(),
+                        asset.getStartOffset(), asset.getDeclaredLength(), extras);
+            } catch (RuntimeException failure) {
+                try { asset.close(); } catch (IOException closeFailure) {
+                    failure.addSuppressed(closeFailure);
+                }
+                throw failure;
+            }
         } finally {
             Binder.restoreCallingIdentity(callingIdentity);
         }

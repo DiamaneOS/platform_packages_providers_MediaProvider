@@ -37,6 +37,7 @@ import static org.mockito.Mockito.when;
 
 import android.Manifest;
 import android.app.UiAutomation;
+import android.content.ContentProviderClient;
 import android.content.ContentResolver;
 import android.content.ContentUris;
 import android.content.ContentValues;
@@ -65,7 +66,9 @@ import androidx.test.InstrumentationRegistry;
 import androidx.test.filters.SdkSuppress;
 import androidx.test.runner.AndroidJUnit4;
 
+import com.android.providers.media.DatabaseHelper;
 import com.android.providers.media.IsolatedContext;
+import com.android.providers.media.MediaProvider;
 import com.android.providers.media.R;
 import com.android.providers.media.TestConfigStore;
 import com.android.providers.media.flags.Flags;
@@ -167,8 +170,18 @@ public class ModernMediaScannerTest {
         stage(R.raw.test_gif, gif);
         final Uri row = mModern.scanFile(gif, MediaScanner.REASON_IDLE);
         assertNotNull(row);
-        final int[] checked = checkedImageFields(row);
-        assertTrue(checked[0] > 0 && checked[1] > 0);
+        final long id = ContentUris.parseId(row);
+        final DatabaseHelper database = isolatedExternalDatabase();
+        // The packaged test_gif logical screen is 600 by 336 pixels.
+        final int[] checked = {600, 336, FileColumns._SPECIAL_FORMAT_GIF};
+        final ContentValues checkedMetadata = new ContentValues();
+        checkedMetadata.put(FileColumns.WIDTH, checked[0]);
+        checkedMetadata.put(FileColumns.HEIGHT, checked[1]);
+        checkedMetadata.put(FileColumns._SPECIAL_FORMAT, checked[2]);
+        assertEquals(1, (int) database.runWithTransaction(db ->
+                db.update("files", checkedMetadata, "_id=?", new String[] {Long.toString(id)})));
+        org.junit.Assert.assertArrayEquals("Checked values before retry",
+                checked, checkedImageFields(database, id));
         final Class<?> decode = com.android.providers.media.vmdecode.VmDecode.class;
         final var probes = decode.getDeclaredField("sProbeCache");
         probes.setAccessible(true);
@@ -180,11 +193,14 @@ public class ModernMediaScannerTest {
                 android.os.SystemClock.uptimeMillis() - 1, null, null)) {
             retry.run();
         }
-        assertTrue(com.android.providers.media.vmdecode.VmDecode.unavailableCount() > before);
-        org.junit.Assert.assertArrayEquals(checked, checkedImageFields(row));
+        assertTrue("The exact retry must observe a decoder refusal",
+                com.android.providers.media.vmdecode.VmDecode.unavailableCount() > before);
+        org.junit.Assert.assertArrayEquals("Checked values after refusal",
+                checked, checkedImageFields(database, id));
         final var ledger = VmFillIns.class.getDeclaredField("ledger");
         ledger.setAccessible(true);
-        assertTrue(((ScanRetryLedger) ledger.get(retry)).pending());
+        assertTrue("The decoder refusal must keep the exact retry pending",
+                ((ScanRetryLedger) ledger.get(retry)).pending());
     }
 
     private VmFillIns exactRetry() throws Exception {
@@ -196,13 +212,28 @@ public class ModernMediaScannerTest {
         }, mock(android.os.Handler.class));
     }
 
-    private int[] checkedImageFields(Uri uri) {
-        try (Cursor row = mIsolatedResolver.query(uri, new String[] {"width", "height",
-                FileColumns._SPECIAL_FORMAT}, null, null, null)) {
-            assertTrue(row.moveToFirst());
-            assertFalse(row.isNull(2));
-            return new int[] {row.getInt(0), row.getInt(1), row.getInt(2)};
+    private DatabaseHelper isolatedExternalDatabase() throws Exception {
+        try (ContentProviderClient client = mIsolatedResolver.acquireContentProviderClient(
+                MediaStore.AUTHORITY)) {
+            assertNotNull(client);
+            final MediaProvider provider = (MediaProvider) client.getLocalContentProvider();
+            assertNotNull(provider);
+            final var field = MediaProvider.class.getDeclaredField("mExternalDatabase");
+            field.setAccessible(true);
+            return (DatabaseHelper) field.get(provider);
         }
+    }
+
+    private static int[] checkedImageFields(DatabaseHelper database, long id) {
+        return database.runWithoutTransaction(db -> {
+            try (Cursor row = db.query("files", new String[] {"width", "height",
+                    FileColumns._SPECIAL_FORMAT}, "_id=?", new String[] {Long.toString(id)},
+                    null, null, null)) {
+                assertTrue(row.moveToFirst());
+                assertFalse(row.isNull(2));
+                return new int[] {row.getInt(0), row.getInt(1), row.getInt(2)};
+            }
+        });
     }
 
     private void automaticRetry(String name, int resource, String metadata) throws Exception {

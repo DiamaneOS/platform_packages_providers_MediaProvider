@@ -41,7 +41,7 @@ final class VmRetryVolumes {
             final File real = file.getCanonicalFile();
             final StorageVolume volume = FileUtils.getStorageVolume(context, real);
             int id = FileUtils.extractUserId(real.getPath());
-            if (id < 0) id = volume.getOwner() == null ? context.getUserId() : volume.getOwner().getIdentifier();
+            if (id < 0) id = volume.getOwner() == null ? context.getUser().getIdentifier() : volume.getOwner().getIdentifier();
             final UserHandle user = UserHandle.of(id);
             final UserCache users = new UserCache(context);
             if (!users.getUsersCached().contains(user) || !mounted(volume) || volume.getDirectory() == null) return null;
@@ -63,7 +63,7 @@ final class VmRetryVolumes {
             final long serial = Long.parseLong(fields[1]);
             final UserManager manager = context.getSystemService(UserManager.class);
             final long currentSerial = manager.getSerialNumberForUser(UserHandle.of(id));
-            if (currentSerial < 0) return new Resolved(null, manager.getUserInfo(id) == null);
+            if (currentSerial < 0) return new Resolved(null, true);
             if (currentSerial != serial) return new Resolved(null, true);
             final UserCache users = new UserCache(context);
             if (!users.getUsersCached().contains(UserHandle.of(id))) return new Resolved(null, false);

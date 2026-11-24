@@ -1244,6 +1244,10 @@ public class MediaDocumentsProvider extends DocumentsProvider {
             } else {
                 throw new UnsupportedOperationException("Unsupported document " + docId);
             }
+        } catch (FileNotFoundException failure) {
+            // DiamaneOS: only the already-authorized document can confirm a missing thumbnail.
+            return com.android.providers.media.vmdecode.VmDocumentThumbnails.failed(
+                    getContext(), docId, signal, failure);
         } finally {
             Binder.restoreCallingIdentity(token);
         }

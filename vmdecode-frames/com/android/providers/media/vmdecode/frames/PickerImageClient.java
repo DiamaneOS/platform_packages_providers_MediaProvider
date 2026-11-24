@@ -44,6 +44,11 @@ public final class PickerImageClient implements AutoCloseable {
     public static final int OK = 0;
     public static final int LATER = 1;
     public static final int REJECTED = 2;
+    public static final int GONE = 3;
+
+    public static final class Missing extends IOException {
+        Missing(String message) { super(message); }
+    }
     private static final long TOTAL_MS = 60_000;
     private static final long ATTEMPT_MS = 30_000;
     private boolean mCancelled;
@@ -126,7 +131,7 @@ public final class PickerImageClient implements AutoCloseable {
                     } else {
                         final String message = data == null ? "No picker result" : data.getString(ERROR);
                         result.completeExceptionally(code == LATER ? new Later(message)
-                                : new IOException(message));
+                                : code == GONE ? new Missing(message) : new IOException(message));
                     }
                 } catch (IOException | RuntimeException e) {
                     result.completeExceptionally(e);

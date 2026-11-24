@@ -315,3 +315,14 @@ android_test_helper_app {
     certificate: "media",
     min_sdk_version: "36",
 }
+
+// DiamaneOS: a second UID holds the remaining cloud permission workers.
+android_test_helper_app {
+    name: "MediaProviderSlowCloudFixture2",
+    manifest: "vm_slow_cloud2/AndroidManifest.xml",
+    srcs: ["vm_slow_cloud/src/**/*.java"],
+    libs: ["framework-mediaprovider.impl"],
+    platform_apis: true,
+    certificate: "media",
+    min_sdk_version: "36",
+}
