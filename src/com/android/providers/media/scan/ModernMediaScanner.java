@@ -187,6 +187,10 @@ import java.util.regex.Pattern;
 public class ModernMediaScanner implements MediaScanner {
     /** The owner package of the file being scanned on this thread, for the decode service's fair queue. */
     private static final ThreadLocal<String> sScanOwner = new ThreadLocal<>();
+    // DiamaneOS: how long the VM work of one file may take in a scan an app waits for.
+    private static final long DEMAND_VM_MS = 500;
+    // DiamaneOS: files whose scan was left without the VM's answers, scanned again once it answers.
+    private final VmFillIns mFillIns = new VmFillIns(this::fillIn);
 
     private static final String TAG = "ModernMediaScanner";
     private static final boolean LOGW = Log.isLoggable(TAG, Log.WARN);
@@ -414,6 +418,16 @@ public class ModernMediaScanner implements MediaScanner {
         } catch (OperationCanceledException ignored) {
             // No-op.
         }
+    }
+
+    // DiamaneOS: scans a file again on the fill-in thread, with no bound on its VM waits. True when the VM answered.
+    private boolean fillIn(@NonNull File file) {
+        if (!file.exists()) {
+            return true;
+        }
+        final int unavailable = VmDecode.unavailableCount();
+        scanFile(file, REASON_DEMAND);
+        return VmDecode.unavailableCount() == unavailable;
     }
 
     @Override
@@ -1017,7 +1031,9 @@ public class ModernMediaScanner implements MediaScanner {
                     final boolean sameMetadata =
                             hasSameMetadata(attrs, realFile, isPendingFromFuse, c);
                     final boolean sameMediaType = actualMediaType == mediaType;
-                    if (sameMetadata && sameMediaType) {
+                    // DiamaneOS: a fill-in scans the file again although it is unchanged: what changed is
+                    // that the decode service answers now (VmFillIns).
+                    if (sameMetadata && sameMediaType && !VmFillIns.isFillInThread()) {
                         if (LOGV) Log.v(TAG, "Skipping unchanged " + file);
                         return FileVisitResult.CONTINUE;
                     }
@@ -1053,12 +1069,20 @@ public class ModernMediaScanner implements MediaScanner {
             final ContentProviderOperation.Builder op;
             Trace.beginSection("Scanner.scanItem");
             sScanOwner.set(scanOwner);
-            try {
+            // DiamaneOS: a scan on demand is one an app's binder call waits for (a file it wrote and published).
+            // Its header reads in the decode service's VM take no longer than Android's own reads would: what the
+            // VM cannot answer in that time is left out and the file is scanned again later (VmFillIns).
+            final boolean bounded = mReason == REASON_DEMAND && !VmFillIns.isFillInThread();
+            final int unavailable = VmDecode.unavailableCount();
+            try (VmDecode.Bound ignored = bounded ? VmDecode.boundWaits(DEMAND_VM_MS, mSignal) : null) {
                 op = scanItem(existingId, realFile, attrs, actualMimeType, actualMediaType,
                         mVolumeName, mRestoreExecutorOptional.orElse(null));
             } finally {
                 sScanOwner.remove();
                 Trace.endSection();
+            }
+            if (VmDecode.unavailableCount() != unavailable) {
+                mFillIns.add(realFile);
             }
             if (op != null) {
                 op.withValue(FileColumns._MODIFIER, FileColumns._MODIFIER_MEDIA_SCAN);

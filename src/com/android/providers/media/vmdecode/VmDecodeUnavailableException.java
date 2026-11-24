@@ -23,11 +23,23 @@ import java.io.IOException;
  * later. It never decodes the file itself.
  */
 public class VmDecodeUnavailableException extends IOException {
+    /**
+     * Starts every message, so a process that gets the failure through a provider call (as a FileNotFoundException
+     * with this message, the picker's thumbnail from MediaProvider) still knows it is worth asking again.
+     */
+    public static final String PREFIX = "decode service unavailable: ";
+
     public VmDecodeUnavailableException(String message) {
-        super(message);
+        super(PREFIX + message);
     }
 
     public VmDecodeUnavailableException(String message, Throwable cause) {
-        super(message, cause);
+        super(PREFIX + message, cause);
+    }
+
+    /** True when {@code e} is this failure, here or passed on by a provider call. */
+    public static boolean isUnavailable(IOException e) {
+        return e instanceof VmDecodeUnavailableException
+                || (e != null && e.getMessage() != null && e.getMessage().contains(PREFIX));
     }
 }

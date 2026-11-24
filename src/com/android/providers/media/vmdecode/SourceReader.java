@@ -21,7 +21,6 @@ import android.system.Os;
 import android.system.OsConstants;
 import android.system.StructStat;
 
-import androidx.annotation.GuardedBy;
 import androidx.annotation.Nullable;
 
 import java.io.FileDescriptor;
@@ -30,43 +29,25 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.Arrays;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.Future;
 import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.TimeoutException;
-import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Reads from a source that may stall for ever (a file on FUSE, which an app can serve through a StorageManager proxy
- * file descriptor) on a thread of its own, with a real deadline. A read that misses its deadline is abandoned: its
- * thread stays blocked until the source answers or goes away, and counts against the owner of the bytes. An owner
- * with {@link #MAX_ABANDONED_PER_OWNER} abandoned reads, or {@link #MAX_ABANDONED} in all, gets no new reads until
- * those end: its requests fail at once, so stalled sources can never take all threads.
+ * Bounded source reads with admission reserved before submission. A stalled worker keeps its own descriptor,
+ * count and byte reservation until it exits, including after its caller times out or is interrupted.
  */
 final class SourceReader {
     static final int MAX_ABANDONED_PER_OWNER = 2;
     static final int MAX_ABANDONED = 8;
     private static final int MAX_ACTIVE = 4;
-    private static final int RUNNING = 0;
-    private static final int FINISHED = 1;
-    private static final int ABANDONED = 2;
-
-    private static final ThreadPoolExecutor sIo = new ThreadPoolExecutor(0, MAX_ACTIVE + MAX_ABANDONED, 30,
+    private static final SourceBudget sBudget = new SourceBudget();
+    private static final ThreadPoolExecutor sIo = new ThreadPoolExecutor(0, MAX_ABANDONED, 30,
             TimeUnit.SECONDS, new SynchronousQueue<>(), r -> {
                 final Thread t = new Thread(r, "VmDecodeIo");
                 t.setDaemon(true);
                 return t;
             });
-
-    private static final Object sLock = new Object();
-    @GuardedBy("sLock")
-    private static final Map<String, Integer> sAbandoned = new HashMap<>();
-    @GuardedBy("sLock")
-    private static int sAbandonedAll;
 
     private SourceReader() {
     }
@@ -93,55 +74,53 @@ final class SourceReader {
      */
     static byte[] read(ParcelFileDescriptor pfd, long offset, long length, int limit, boolean prefix,
             @Nullable String owner, long deadlineMillis) throws IOException {
-        final String key = owner == null ? "" : owner;
-        synchronized (sLock) {
-            if (sAbandoned.getOrDefault(key, 0) >= MAX_ABANDONED_PER_OWNER || sAbandonedAll >= MAX_ABANDONED) {
-                throw new VmDecodeRejectedException("sources of " + key + " stall");
+        return SourceWork.call(sIo, sBudget, owner, 2L * limit, deadlineMillis, () -> {
+            try (ParcelFileDescriptor input = pfd.dup()) {
+                return readAll(input.getFileDescriptor(), offset, length, limit, prefix);
             }
-        }
-        // RUNNING until the read ends (FINISHED) or the caller gives up on it (ABANDONED), whichever is first.
-        final AtomicInteger state = new AtomicInteger(RUNNING);
-        final Future<byte[]> future;
-        try {
-            future = sIo.submit(() -> {
+        }, bytes -> { });
+    }
+
+    /** Source preparation, including open and stat, shares admission and the entry deadline. */
+    static Prepared prepare(java.io.File file, String principal, boolean probe) throws IOException {
+        final int limit = probe ? de.diamaneos.sanitizer.decode.IDecodeService.MAX_PROBE_BYTES
+                : de.diamaneos.sanitizer.decode.IDecodeService.MAX_BUFFERED_BYTES;
+        return SourceWork.call(sIo, sBudget, principal, 2L * limit, 10_000, () -> {
+            try (ParcelFileDescriptor opened = ParcelFileDescriptor.open(file,
+                    ParcelFileDescriptor.MODE_READ_ONLY)) {
+                final StructStat stat;
                 try {
-                    return readAll(pfd.getFileDescriptor(), offset, length, limit, prefix);
-                } finally {
-                    if (!state.compareAndSet(RUNNING, FINISHED)) {
-                        synchronized (sLock) {
-                            sAbandonedAll--;
-                            final int left = sAbandoned.getOrDefault(key, 1) - 1;
-                            if (left <= 0) {
-                                sAbandoned.remove(key);
-                            } else {
-                                sAbandoned.put(key, left);
-                            }
-                        }
-                    }
+                    stat = Os.fstat(opened.getFileDescriptor());
+                } catch (ErrnoException e) {
+                    throw new IOException("source stat failed", e);
                 }
-            });
-        } catch (RuntimeException e) {
-            throw new VmDecodeUnavailableException("no reader thread free", e);
+                final String identity = stat.st_dev + ":" + stat.st_ino + ":" + stat.st_size + ":"
+                        + stat.st_mtim.tv_sec + "." + stat.st_mtim.tv_nsec + ":"
+                        + stat.st_ctim.tv_sec + "." + stat.st_ctim.tv_nsec;
+                final ParcelFileDescriptor prepared;
+                if (onFuse(opened)) {
+                    final byte[] bytes = readAll(opened.getFileDescriptor(), 0, -1, limit, probe);
+                    prepared = VmDecode.memoryFile(bytes, bytes.length);
+                } else {
+                    prepared = opened.dup();
+                }
+                return new Prepared(prepared, identity);
+            }
+        }, Prepared::close);
+    }
+
+    static final class Prepared implements AutoCloseable {
+        final ParcelFileDescriptor file;
+        final String identity;
+
+        Prepared(ParcelFileDescriptor file, String identity) {
+            this.file = file;
+            this.identity = identity;
         }
-        try {
-            return future.get(deadlineMillis, TimeUnit.MILLISECONDS);
-        } catch (TimeoutException e) {
-            synchronized (sLock) {
-                if (state.compareAndSet(RUNNING, ABANDONED)) {
-                    sAbandonedAll++;
-                    sAbandoned.merge(key, 1, Integer::sum);
-                }
-            }
-            throw new VmDecodeRejectedException("source too slow");
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new VmDecodeUnavailableException("interrupted", e);
-        } catch (ExecutionException e) {
-            final Throwable cause = e.getCause();
-            if (cause instanceof IOException) {
-                throw (IOException) cause;
-            }
-            throw new IOException("source not readable", cause);
+
+        @Override
+        public void close() throws IOException {
+            file.close();
         }
     }
 
