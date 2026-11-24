@@ -167,13 +167,16 @@ public final class VmDecode {
     }
 
     public static Bound boundWaits(long timeoutMs, CancellationSignal signal, Runnable checkpoint) {
+        return boundUntil(SystemClock.uptimeMillis() + Math.max(1, timeoutMs), signal, checkpoint);
+    }
+
+    public static Bound boundUntil(long end, CancellationSignal signal, Runnable checkpoint) {
         final Runnable previousCheck = sBoundCheck.get();
         sBoundCheck.set(checkpoint == null ? previousCheck : checkpoint);
         final CancellationSignal previousSignal = sBoundSignal.get();
         sBoundSignal.set(signal == null ? previousSignal : signal);
         final long[] bound = sBound.get();
         final long previous = bound[0];
-        final long end = SystemClock.uptimeMillis() + Math.max(1, timeoutMs);
         bound[0] = previous == 0 ? end : Math.min(previous, end);
         return new Bound(previous, previousSignal, previousCheck);
     }

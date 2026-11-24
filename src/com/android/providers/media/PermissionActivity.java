@@ -130,6 +130,8 @@ public class PermissionActivity extends Activity {
     private Dialog progressDialog;
     private TextView titleView;
     private Handler mHandler;
+    private com.android.providers.media.vmdecode.VmDialogReload mVmDialogReload;
+    private DescriptionTask mVmDescriptionTask;
     private Runnable mShowProgressDialogRunnable = () -> {
         // We will show the progress dialog, add the dim effect back.
         getWindow().clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND);
@@ -245,7 +247,12 @@ public class PermissionActivity extends Activity {
         // Kick off async loading of description to show in dialog
         final View bodyView = getLayoutInflater().inflate(R.layout.permission_body, null, false);
         handleImageViewVisibility(bodyView, uris);
-        new DescriptionTask(bodyView).execute(uris);
+        // DiamaneOS: a visible preview retries a temporary VM failure with its original URI set.
+        mVmDialogReload = new com.android.providers.media.vmdecode.VmDialogReload(bodyView, () -> {
+            mVmDescriptionTask = new DescriptionTask(bodyView);
+            mVmDescriptionTask.execute(new ArrayList<>(uris));
+        });
+        mVmDialogReload.start();
 
         // Initialising the custom dialog title
         final View dialogTitleView = getLayoutInflater().inflate(
@@ -368,6 +375,9 @@ public class PermissionActivity extends Activity {
 
     @Override
     public void onDestroy() {
+        // DiamaneOS: detached previews cannot keep retrying or deliver a late result.
+        if (mVmDialogReload != null) mVmDialogReload.close();
+        if (mVmDescriptionTask != null) mVmDescriptionTask.cancel(true);
         super.onDestroy();
         if (mHandler != null) {
             mHandler.removeCallbacks(mShowProgressDialogRunnable);
@@ -834,7 +844,22 @@ public class PermissionActivity extends Activity {
 
         @Override
         protected List<Description> doInBackground(List<Uri>... params) {
-            final List<Uri> uris = params[0];
+            final android.os.CancellationSignal signal = new android.os.CancellationSignal();
+            final long remaining = mVmDialogReload == null ? 30_000 : mVmDialogReload.remainingMillis();
+            try (VmDecode.Bound bound = VmDecode.boundWaits(Math.max(1, Math.min(30_000, remaining)), signal,
+                    () -> {
+                        if (isCancelled() || (mVmDialogReload != null && mVmDialogReload.isClosed())) {
+                            throw new android.os.OperationCanceledException();
+                        }
+                    })) {
+                return loadDescriptions(params[0]);
+            } finally {
+                VmDecode.cancelWaits(signal);
+            }
+        }
+
+        private List<Description> loadDescriptions(List<Uri> input) {
+            final List<Uri> uris = input;
             final List<Description> res = new ArrayList<>();
 
             // If the size is zero, return the res directly.
@@ -875,6 +900,7 @@ public class PermissionActivity extends Activity {
             }
 
             for (Uri uri : uris) {
+                if (isCancelled() || (mVmDialogReload != null && mVmDialogReload.isClosed())) break;
                 try {
                     final Description desc = new Description(bodyView.getContext(), uri, loadFlags);
                     res.add(desc);
@@ -898,6 +924,11 @@ public class PermissionActivity extends Activity {
 
         @Override
         protected void onPostExecute(List<Description> results) {
+            // DiamaneOS: the result belongs only to the live dialog that requested it.
+            if (isFinishing() || isDestroyed() || isCancelled()
+                    || (mVmDialogReload != null && mVmDialogReload.isClosed())) return;
+            if (mVmDialogReload != null) mVmDialogReload.complete(
+                    results.stream().anyMatch(result -> result.retryable));
             // Decide how to bind results based on how many are visual
             final List<Description> visualResults = results.stream().filter(Description::isVisual)
                     .collect(Collectors.toList());
@@ -912,7 +943,9 @@ public class PermissionActivity extends Activity {
             // This is pretty hacky, but somehow our dynamic loading of content
             // can confuse accessibility focus, so refocus on the actual dialog
             // title to announce ourselves properly
-            titleView.sendAccessibilityEvent(AccessibilityEvent.TYPE_VIEW_ACCESSIBILITY_FOCUSED);
+            if (mVmDialogReload == null || mVmDialogReload.firstResult()) {
+                titleView.sendAccessibilityEvent(AccessibilityEvent.TYPE_VIEW_ACCESSIBILITY_FOCUSED);
+            }
         }
 
         /**
@@ -921,6 +954,9 @@ public class PermissionActivity extends Activity {
          */
         private void bindAsFull(@NonNull Description result) {
             final ImageView thumbFull = bodyView.requireViewById(R.id.thumb_full);
+            if (result.full != null || result.thumbnail != null) {
+                com.android.providers.media.vmdecode.VmDialogReload.recovered(thumbFull);
+            }
             if (result.full != null) {
                 result.bindFull(thumbFull);
             } else if (result.thumbnail != null) {
@@ -1027,60 +1063,33 @@ public class PermissionActivity extends Activity {
         public @Nullable Bitmap thumbnail;
         public @Nullable Bitmap full;
         public @Nullable Icon mimeIcon;
+        public boolean retryable;
 
         public static final int LOAD_CONTENT_DESCRIPTION = 1 << 0;
         public static final int LOAD_THUMBNAIL = 1 << 1;
         public static final int LOAD_FULL = 1 << 2;
 
-        /** DiamaneOS: the owner package of a media item, or null. */
-        private static String queryOwner(ContentResolver resolver, Uri uri) {
-            try (Cursor c = resolver.query(uri, new String[] {MediaColumns.OWNER_PACKAGE_NAME},
-                    null, null)) {
-                return c != null && c.moveToFirst() ? c.getString(0) : null;
-            } catch (RuntimeException e) {
-                return null;
-            }
-        }
-
         public Description(Context context, Uri uri, int loadFlags) {
             final Resources res = context.getResources();
             final ContentResolver resolver = context.getContentResolver();
+            String mimeType = null;
 
             try {
-                // Load description first so that we'll always have something
-                // textual to display in case we have image trouble below
-                if ((loadFlags & LOAD_CONTENT_DESCRIPTION) != 0) {
-                    try (Cursor c = resolver.query(uri,
-                            new String[]{MediaColumns.DISPLAY_NAME}, null, null)) {
-                        if (c.moveToFirst()) {
-                            contentDescription = c.getString(0);
-                        }
-                    }
-                }
-                // Nothing is decoded in this process. An image is decoded from the file in the decode
-                // service's VM. Video and audio previews are MediaProvider's thumbnails, made as before
-                // (a video frame in the media sandbox, embedded pictures in the VM), and their thumbnail
-                // bytes are decoded in the VM too. When the service is unavailable the IOException below
-                // shows the type icon instead.
                 VmDecode.init(context);
-                final String mimeType = resolver.getType(uri);
+                final com.android.providers.media.vmdecode.VmMediaRows.Source source =
+                        VmDecode.displaySource(resolver, uri);
+                if ((loadFlags & LOAD_CONTENT_DESCRIPTION) != 0) contentDescription = source.displayName;
+                mimeType = source.mimeType;
                 final boolean image = mimeType != null && mimeType.startsWith("image/");
-                final String owner = queryOwner(resolver, uri);
+                final String owner = source.principal;
+                try (VmDecode.UserScope user = VmDecode.forUser(source.user);
+                        VmDecode.Bound bound = VmDecode.boundWaits(30_000)) {
                 if ((loadFlags & LOAD_THUMBNAIL) != 0) {
                     final int side = res.getDisplayMetrics().widthPixels;
                     if (image) {
                         thumbnail = VmDecode.decodeForDisplay(resolver, uri, owner, side, side);
                     } else {
-                        final Bundle opts = new Bundle();
-                        opts.putParcelable(ContentResolver.EXTRA_SIZE, new Point(side, side));
-                        try (AssetFileDescriptor asset = resolver.openTypedAssetFileDescriptor(uri,
-                                "image/*", opts, null)) {
-                            if (asset == null) {
-                                throw new FileNotFoundException("no thumbnail for " + uri);
-                            }
-                            thumbnail = VmDecode.decodeAsset(asset, owner,
-                                    VmDecode.PRIORITY_USER_WAITING, side, side, null);
-                        }
+                        thumbnail = VmDecode.thumbnailForDisplay(resolver, uri, owner, side, side);
                     }
                 }
                 if ((loadFlags & LOAD_FULL) != 0) {
@@ -1094,10 +1103,11 @@ public class PermissionActivity extends Activity {
                         full = thumbnail;
                     }
                 }
+                }
             } catch (IOException e) {
+                retryable = com.android.providers.media.vmdecode.VmDecodeUnavailableException.isUnavailable(e);
                 Log.w(TAG, e);
                 if (thumbnail == null && full == null) {
-                    final String mimeType = resolver.getType(uri);
                     if (mimeType != null) {
                         mimeIcon = resolver.getTypeInfo(mimeType).getIcon();
                     }

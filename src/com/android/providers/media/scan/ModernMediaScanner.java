@@ -146,6 +146,7 @@ import java.io.IOException;
 import java.nio.file.FileVisitResult;
 import java.nio.file.FileVisitor;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.attribute.BasicFileAttributes;
@@ -190,7 +191,7 @@ public class ModernMediaScanner implements MediaScanner {
     // DiamaneOS: how long the VM work of one file may take in a scan an app waits for.
     private static final long DEMAND_VM_MS = 500;
     // DiamaneOS: files whose scan was left without the VM's answers, scanned again once it answers.
-    private final VmFillIns mFillIns = new VmFillIns(this::fillIn);
+    private final VmFillIns mFillIns;
 
     private static final String TAG = "ModernMediaScanner";
     private static final boolean LOGW = Log.isLoggable(TAG, Log.WARN);
@@ -288,6 +289,7 @@ public class ModernMediaScanner implements MediaScanner {
 
     public ModernMediaScanner(@NonNull Context context, @NonNull ConfigStore configStore) {
         mContext = requireNonNull(context);
+        mFillIns = new VmFillIns(context, this::fillIn);
         mDrmClient = new DrmManagerClient(context);
         mDefaultOemMetadataServicePackage = configStore.getDefaultOemMetadataServicePackage();
 
@@ -420,14 +422,15 @@ public class ModernMediaScanner implements MediaScanner {
         }
     }
 
-    // DiamaneOS: scans a file again on the fill-in thread, with no bound on its VM waits. True when the VM answered.
+    // DiamaneOS: retry one file and settle a completed attempt even when the file was excluded.
     private boolean fillIn(@NonNull File file) {
-        if (!file.exists()) {
-            return true;
-        }
+        VmFillIns.clearOutcome();
         final int unavailable = VmDecode.unavailableCount();
-        scanFile(file, REASON_DEMAND);
-        return VmDecode.unavailableCount() == unavailable;
+        try (VmDecode.Bound bound = VmDecode.boundWaits(2_000, null)) {
+            scanFile(file, REASON_DEMAND);
+            return !VmFillIns.wasDeferred()
+                    && VmDecode.unavailableCount() == unavailable;
+        }
     }
 
     @Override
@@ -437,6 +440,7 @@ public class ModernMediaScanner implements MediaScanner {
         try {
             file = canonicalize(file);
         } catch (IOException e) {
+            if (VmFillIns.isFillInThread()) VmFillIns.deferred();
             Log.e(TAG, "Couldn't canonicalize file to scan" + file, e);
             return null;
         }
@@ -445,10 +449,11 @@ public class ModernMediaScanner implements MediaScanner {
             scan.run();
             return scan.getFirstResult();
         } catch (FileNotFoundException e) {
+            if (VmFillIns.isFillInThread()) VmFillIns.deferred();
             Log.e(TAG, "Couldn't find file to scan", e) ;
             return null;
         } catch (OperationCanceledException ignored) {
-            // No-op.
+            if (VmFillIns.isFillInThread()) VmFillIns.deferred();
             return null;
         }
     }
@@ -603,7 +608,7 @@ public class ModernMediaScanner implements MediaScanner {
             mRestoreExecutorOptional = RestoreExecutor.getRestoreExecutor(mContext);
 
             mStartGeneration = MediaStore.getGeneration(mResolver, mVolumeName);
-            mSingleFile = mRoot.isFile();
+            mSingleFile = VmFillIns.isFillInThread() || mRoot.isFile();
             mExcludeDirs = new ArrayList<>();
 
             Trace.endSection();
@@ -628,9 +633,9 @@ public class ModernMediaScanner implements MediaScanner {
 
             // Second, reconcile all items known in the database against all the
             // items we scanned above
-            if (mSingleFile && mScannedIds.size() == 1) {
+            if (VmFillIns.isFillInThread() || (mSingleFile && mScannedIds.size() == 1)) {
                 // We can safely skip this step if the scan targeted a single
-                // file which we scanned above
+                // file which we scanned above. An exact retry owns no subtree reconciliation.
             } else {
                 reconcileAndClean();
             }
@@ -665,7 +670,15 @@ public class ModernMediaScanner implements MediaScanner {
                     acquireDirectoryLock(mRoot.getParentFile().toPath().toString());
                 }
                 try {
-                    Files.walkFileTree(mRoot.toPath(), this);
+                    if (VmFillIns.isFillInThread()) {
+                        // DiamaneOS: an exact file replaced by a directory must not be traversed.
+                        final Path path = mRoot.toPath();
+                        final BasicFileAttributes attrs = Files.readAttributes(path,
+                                BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+                        if (attrs.isRegularFile()) visitFile(path, attrs);
+                    } else {
+                        Files.walkFileTree(mRoot.toPath(), this);
+                    }
                     applyPending();
                 } catch (IOException e) {
                     // This should never happen, so yell loudly
@@ -955,6 +968,8 @@ public class ModernMediaScanner implements MediaScanner {
         @Override
         public FileVisitResult visitFile(Path file, BasicFileAttributes attrs)
                 throws IOException {
+            // DiamaneOS: source preparation and cold binding use the same entry deadline.
+            final long decodeEnd = android.os.SystemClock.uptimeMillis() + DEMAND_VM_MS;
             if (LOGV) Log.v(TAG, "Visiting " + file);
             mFileCount++;
 
@@ -1080,7 +1095,7 @@ public class ModernMediaScanner implements MediaScanner {
             final boolean bounded = mReason == REASON_DEMAND && !VmFillIns.isFillInThread();
             final int unavailable = VmDecode.unavailableCount();
             try (VmDecode.UserScope user = VmDecode.forUser(scanUser);
-                    VmDecode.Bound ignored = bounded ? VmDecode.boundWaits(DEMAND_VM_MS, mSignal) : null) {
+                    VmDecode.Bound ignored = bounded ? VmDecode.boundUntil(decodeEnd, mSignal, null) : null) {
                 op = scanItem(existingId, realFile, attrs, actualMimeType, actualMediaType,
                         mVolumeName, mRestoreExecutorOptional.orElse(null));
             } catch (com.android.providers.media.vmdecode.MetadataAdmission.Pressure pressure) {
@@ -1095,6 +1110,8 @@ public class ModernMediaScanner implements MediaScanner {
             }
             if (VmDecode.unavailableCount() != unavailable) {
                 mFillIns.add(realFile);
+                // DiamaneOS: a deferred retry cannot replace metadata on an existing row.
+                if (existingId != -1 && VmFillIns.isFillInThread()) op = null;
             }
             if (op != null) {
                 op.withValue(FileColumns._MODIFIER, FileColumns._MODIFIER_MEDIA_SCAN);
@@ -1214,6 +1231,7 @@ public class ModernMediaScanner implements MediaScanner {
         @Override
         public FileVisitResult visitFileFailed(Path file, IOException exc)
                 throws IOException {
+            if (VmFillIns.isFillInThread()) VmFillIns.deferred();
             Log.w(TAG, "Failed to visit " + file + ": " + exc);
             return FileVisitResult.CONTINUE;
         }
@@ -1285,6 +1303,8 @@ public class ModernMediaScanner implements MediaScanner {
                     ContentProviderOperation operation = mPending.get(index);
 
                     if (result.exception != null) {
+                        // DiamaneOS: a logged batch failure cannot acknowledge retry coverage.
+                        if (VmFillIns.isFillInThread()) VmFillIns.deferred();
                         Log.w(TAG, "Failed to apply " + operation, result.exception);
                     }
 
@@ -1298,6 +1318,7 @@ public class ModernMediaScanner implements MediaScanner {
                     }
                 }
             } catch (RemoteException | OperationApplicationException e) {
+                if (VmFillIns.isFillInThread()) VmFillIns.deferred();
                 Log.w(TAG, "Failed to apply", e);
             } finally {
                 mPending.clear();

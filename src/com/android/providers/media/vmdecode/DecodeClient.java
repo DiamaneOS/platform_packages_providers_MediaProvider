@@ -92,6 +92,12 @@ final class DecodeClient {
     private final Lane mUserWaiting = new Lane("VmDecodeUser", 4, 8, 2);
     private final Lane mBackground = new Lane("VmDecodeBackground", 2, 16, 1);
 
+    private final ThreadPoolExecutor mBindingWork = new ThreadPoolExecutor(0, 1, 30,
+            TimeUnit.SECONDS, new ArrayBlockingQueue<>(1), work -> {
+                final Thread thread = new Thread(work, "VmDecodeBind");
+                thread.setDaemon(true);
+                return thread;
+            });
     private final Object mLock = new Object();
     @GuardedBy("mLock")
     private IDecodeService mService;
@@ -106,11 +112,23 @@ final class DecodeClient {
     // A call failed as unavailable and none succeeded since.
     private volatile boolean mFailed;
 
+    private final class Connected {
+        final IDecodeService service;
+        final Connection connection;
+        Connected(IDecodeService service, Connection connection) {
+            this.service = service;
+            this.connection = connection;
+        }
+    }
+
     private final class Connection implements ServiceConnection {
+        boolean finished;
+        boolean registered;
+        boolean retired;
         @Override
         public void onServiceConnected(ComponentName name, IBinder binder) {
             synchronized (mLock) {
-                if (mConnection != this || !mBinding) return;
+                if (mConnection != this || !mBinding || retired) return;
                 mService = IDecodeService.Stub.asInterface(binder);
                 mLock.notifyAll();
             }
@@ -173,8 +191,9 @@ final class DecodeClient {
     private <T> T callOnce(int priority, @Nullable String owner, @NonNull Call<T> call)
             throws VmDecodeUnavailableException, VmDecodeRejectedException {
         final boolean waiting = priority == IDecodeService.PRIORITY_USER_WAITING;
-        final IDecodeService service = connect(bounded(waiting ? CONNECT_TIMEOUT_USER_WAITING_MS
+        final Connected connected = connect(bounded(waiting ? CONNECT_TIMEOUT_USER_WAITING_MS
                 : CONNECT_TIMEOUT_BACKGROUND_MS));
+        final IDecodeService service = connected.service;
         final Lane lane = waiting ? mUserWaiting : mBackground;
         final String key = owner == null ? "" : owner;
         final Task<T> task = new Task<>(() -> call.run(service));
@@ -207,7 +226,7 @@ final class DecodeClient {
                 }
                 // Started and not answered in time: the service broke its own deadline. Drop the binding, the next
                 // call binds again.
-                unbind();
+                unbind(connected.connection);
                 throw new VmDecodeUnavailableException("decode service missed its deadline");
             }
         } catch (android.os.OperationCanceledException e) {
@@ -254,7 +273,7 @@ final class DecodeClient {
             try {
                 final DecodeRequest request = new DecodeRequest();
                 request.ownerUser = sourceUser;
-                connect(CONNECT_TIMEOUT_USER_WAITING_MS).prepare(request);
+                connect(CONNECT_TIMEOUT_USER_WAITING_MS).service.prepare(request);
             } catch (VmDecodeUnavailableException | RemoteException | RuntimeException e) {
                 Log.w(TAG, "prepare hint not sent: " + e.getMessage());
             }
@@ -333,53 +352,87 @@ final class DecodeClient {
         }
     }
 
-    private IDecodeService connect(long timeoutMs) throws VmDecodeUnavailableException {
+    private Connected connect(long timeoutMs) throws VmDecodeUnavailableException {
+        final long callerEnd = VmDecode.boundEnd();
+        final long end = callerEnd == 0 ? SystemClock.uptimeMillis() + timeoutMs
+                : Math.min(callerEnd, SystemClock.uptimeMillis() + timeoutMs);
         synchronized (mLock) {
-            if (mService != null && mService.asBinder().isBinderAlive()) {
-                return mService;
-            }
-            mService = null;
-            if (mBinding && SystemClock.uptimeMillis() - mBindStart >= STALE_BIND_MS) {
-                unbind(mConnection);
-            }
-            if (!mBinding) {
-                final Intent intent = serviceIntent();
-                if (intent == null) {
-                    throw new VmDecodeUnavailableException("no decode service in the system image");
-                }
-                try {
-                    mConnection = new Connection();
-                    mBindStart = SystemClock.uptimeMillis();
-                    mBinding = true;
-                    if (!mContext.bindService(intent, mConnection,
-                            Context.BIND_AUTO_CREATE | Context.BIND_IMPORTANT)) {
-                        unbind(mConnection);
-                    }
-                } catch (SecurityException e) {
-                    unbind(mConnection);
-                    throw new VmDecodeUnavailableException("not allowed to bind the decode service", e);
-                }
-                if (!mBinding) {
-                    throw new VmDecodeUnavailableException("decode service did not bind");
-                }
-            }
-            final long end = SystemClock.uptimeMillis() + timeoutMs;
-            while (mService == null) {
+            Connection attempt = null;
+            while (true) {
                 VmDecode.checkBoundCancellation();
-                if (!mBinding) throw new VmDecodeUnavailableException("decode binding was dropped");
-                final long left = end - SystemClock.uptimeMillis();
-                if (left <= 0) {
-                    if (SystemClock.uptimeMillis() - mBindStart >= STALE_BIND_MS) unbind(mConnection);
+                if (attempt != null && attempt.retired) {
+                    throw new VmDecodeUnavailableException("decode binding was dropped");
+                }
+                final long now = SystemClock.uptimeMillis();
+                if (now >= end) {
                     throw new VmDecodeUnavailableException("decode service did not connect in time");
                 }
+                if (mService != null && mService.asBinder().isBinderAlive()) {
+                    return new Connected(mService, mConnection);
+                }
+                mService = null;
+                if (mBinding && now - mBindStart >= STALE_BIND_MS) unbind(mConnection);
+                if (mConnection == null) {
+                    final Connection connection = new Connection();
+                    mConnection = connection;
+                    mBindStart = now;
+                    mBinding = true;
+                    try {
+                        mBindingWork.execute(() -> beginBind(connection));
+                    } catch (RuntimeException failure) {
+                        mConnection = null;
+                        mBinding = false;
+                        throw new VmDecodeUnavailableException("decode bind worker unavailable", failure);
+                    }
+                }
+                if (attempt == null && mBinding) attempt = mConnection;
                 try {
-                    mLock.wait(Math.min(left, 50));
-                } catch (InterruptedException e) {
+                    mLock.wait(Math.min(end - now, 50));
+                } catch (InterruptedException failure) {
                     Thread.currentThread().interrupt();
-                    throw new VmDecodeUnavailableException("interrupted", e);
+                    throw new VmDecodeUnavailableException("interrupted", failure);
                 }
             }
-            return mService;
+        }
+    }
+
+    private void beginBind(Connection connection) {
+        boolean registered = false;
+        try {
+            final Intent intent = serviceIntent();
+            if (intent != null) {
+                registered = mContext.bindService(intent, connection,
+                        Context.BIND_AUTO_CREATE | Context.BIND_IMPORTANT);
+            }
+        } catch (RuntimeException failure) {
+            Log.w(TAG, "decode binding failed: " + failure.getMessage());
+        } finally {
+            final boolean cleanup;
+            synchronized (mLock) {
+                connection.registered = registered;
+                connection.finished = true;
+                if (!registered) connection.retired = true;
+                cleanup = connection.retired;
+                mLock.notifyAll();
+            }
+            if (cleanup) finishUnbind(connection);
+        }
+    }
+
+    private void finishUnbind(Connection connection) {
+        try {
+            if (connection.registered) mContext.unbindService(connection);
+        } catch (RuntimeException ignored) {
+            // The framework may already have removed this registration.
+        } finally {
+            synchronized (mLock) {
+                if (mConnection == connection) {
+                    mConnection = null;
+                    mBinding = false;
+                    mService = null;
+                }
+                mLock.notifyAll();
+            }
         }
     }
 
@@ -399,25 +452,13 @@ final class DecodeClient {
         return intent.setComponent(new ComponentName(app.packageName, info.serviceInfo.name));
     }
 
-    private void unbind() {
-        synchronized (mLock) {
-            unbind(mConnection);
-        }
-    }
-
     private void unbind(Connection expected) {
         synchronized (mLock) {
-            if (mConnection != expected) return;
-            if (mBinding) {
-                try {
-                    mContext.unbindService(mConnection);
-                } catch (IllegalArgumentException ignored) {
-                    // Already unbound.
-                }
-            }
+            if (expected == null || mConnection != expected || expected.retired) return;
+            expected.retired = true;
             mBinding = false;
-            mConnection = null;
             mService = null;
+            if (expected.finished) mBindingWork.execute(() -> finishUnbind(expected));
             mLock.notifyAll();
         }
     }
