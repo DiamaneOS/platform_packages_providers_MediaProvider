@@ -41,6 +41,8 @@ public final class VmThumbnailDeletes implements AutoCloseable {
     private final Set<Root> retryRoots = new HashSet<>();
     private final Map<Integer, StorageVolume> available = new HashMap<>();
     private final Set<Integer> unavailable = new HashSet<>();
+    // Media-sharing profiles that are enabled but not running: covered on the next pass, never polled for.
+    private final Set<Integer> stopped = new HashSet<>();
     private final List<Entry> entries = new ArrayList<>();
     private String revision;
     private String coverageRevision;
@@ -172,6 +174,7 @@ public final class VmThumbnailDeletes implements AutoCloseable {
         if (!coverage && entries.isEmpty()) return false;
         final Set<Integer> previouslyUnavailable = Set.copyOf(unavailable);
         unavailable.clear();
+        stopped.clear();
         if (scan) retryRoots.clear();
         revision = currentRevision;
         retryExact = false;
@@ -191,7 +194,10 @@ public final class VmThumbnailDeletes implements AutoCloseable {
         final UserManager profiles = context.getSystemService(UserManager.class);
         for (UserHandle user : profiles.getUserProfiles()) {
             if (!available.containsKey(user.getIdentifier()) && profiles.getUserProperties(user)
-                    .isMediaSharedWithParent()) unavailable.add(user.getIdentifier());
+                    .isMediaSharedWithParent()) {
+                unavailable.add(user.getIdentifier());
+                stopped.add(user.getIdentifier());
+            }
         }
         retryRoots.removeIf(root -> !available.containsKey(root.user) && !unavailable.contains(root.user)
                 && profiles.getSerialNumberForUser(UserHandle.of(root.user)) < 0);
@@ -264,7 +270,7 @@ public final class VmThumbnailDeletes implements AutoCloseable {
         revision = null;
         synchronized (this) {
             if (refresh) later(0);
-            else if (retryExact || !retryRoots.isEmpty() || !unavailable.isEmpty()
+            else if (retryExact || !retryRoots.isEmpty() || !stopped.containsAll(unavailable)
                     || (dirty && available.isEmpty())) later(60_000);
         }
     }
