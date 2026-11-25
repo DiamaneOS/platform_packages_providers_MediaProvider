@@ -607,7 +607,7 @@ public final class VmDecode {
                 }
                 // In the file's colour space, as Android's decode gives it (sRGB or Display P3).
                 final Bitmap bitmap = Bitmap.createBitmap(reply.width, reply.height, Bitmap.Config.ARGB_8888,
-                        true, android.graphics.GateColorSpaces.of(reply.colorSpace, reply.colorDescription));
+                        true, checkedColour(reply.colorSpace, reply.colorDescription));
                 bitmap.copyPixelsFromBuffer(ByteBuffer.wrap(frame));
                 // Ultra HDR: the gain map, every stripe checked, attached as Android's decode attaches it, so a
                 // thumbnail encoded from this bitmap keeps it.
@@ -772,5 +772,25 @@ public final class VmDecode {
         } catch (ErrnoException e) {
             throw new FileNotFoundException(file + ": " + e.getMessage());
         }
+    }
+
+    // A checked reply's wire colour (DecodeChecks validated it) as a public ColorSpace, as the framework's
+    // GateColorSpaces builds it. The module SDK cannot see that hidden class.
+    private static android.graphics.ColorSpace checkedColour(int value, float[] description) {
+        final android.graphics.ColorSpace.Named[] named = {android.graphics.ColorSpace.Named.SRGB,
+                android.graphics.ColorSpace.Named.DISPLAY_P3, android.graphics.ColorSpace.Named.ADOBE_RGB,
+                android.graphics.ColorSpace.Named.PRO_PHOTO_RGB, android.graphics.ColorSpace.Named.BT2020,
+                android.graphics.ColorSpace.Named.BT2020_HLG, android.graphics.ColorSpace.Named.BT2020_PQ,
+                android.graphics.ColorSpace.Named.LINEAR_SRGB};
+        if (value >= 0 && value < named.length) return android.graphics.ColorSpace.get(named[value]);
+        if (value != 8 || description == null || description.length != 16) {
+            throw new IllegalArgumentException("unchecked colour " + value);
+        }
+        final float[] xyz = java.util.Arrays.copyOf(description, 9);
+        final android.graphics.ColorSpace.Rgb.TransferParameters transfer =
+                new android.graphics.ColorSpace.Rgb.TransferParameters(description[9], description[10],
+                        description[11], description[12], description[13], description[14], description[15]);
+        final android.graphics.ColorSpace matched = android.graphics.ColorSpace.match(xyz, transfer);
+        return matched != null ? matched : new android.graphics.ColorSpace.Rgb("Unknown", xyz, transfer);
     }
 }
