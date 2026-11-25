@@ -91,6 +91,7 @@ public final class VmThumbnailDeletes implements AutoCloseable {
     }
 
     private static synchronized boolean custody(Context context) {
+        if (sharedClone(context)) return false;
         if (lease != null && lease.isValid()) return true;
         try {
             final android.content.pm.ProviderInfo producer = context.getPackageManager()
@@ -107,6 +108,17 @@ public final class VmThumbnailDeletes implements AutoCloseable {
             lease = held;
             return true;
         } catch (IOException | RuntimeException failure) { return false; }
+    }
+
+    // A media-sharing clone's storage root is its parent's, swept by the parent user's provider: a provider started in
+    // the clone never takes custody of it. Unknown counts as a clone.
+    private static boolean sharedClone(Context context) {
+        try {
+            final UserManager users = context.getSystemService(UserManager.class);
+            return users.isCloneProfile() && users.getUserProperties(context.getUser()).isMediaSharedWithParent();
+        } catch (RuntimeException unavailable) {
+            return true;
+        }
     }
 
     private VmThumbnailDeletes(Context context, SQLiteDatabase database) {
@@ -260,7 +272,10 @@ public final class VmThumbnailDeletes implements AutoCloseable {
     private void run() {
         synchronized (this) { queued = false; }
         if (closed) return;
-        if (!custody(context)) { later(60_000); return; }
+        if (!custody(context)) {
+            if (!sharedClone(context)) later(60_000);
+            return;
+        }
         ThumbnailCacheFiles.writerReady(true);
         try {
             if (revision == null && !begin()) return;
