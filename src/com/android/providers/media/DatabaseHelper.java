@@ -188,6 +188,7 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
     private static final int NOTIFY_BATCH_SIZE = 256;
 
     final Context mContext;
+    private com.android.providers.media.vmdecode.VmThumbnailDeletes mThumbnailDeletes;
     final String mName;
     final int mVersion;
     final String mVolumeName;
@@ -374,8 +375,18 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
     }
 
     @Override
+    public synchronized void close() {
+        // DiamaneOS: a retired helper cannot retain a cache maintenance continuation.
+        if (mThumbnailDeletes != null) mThumbnailDeletes.close();
+        super.close();
+    }
+
+    @Override
     public void onConfigure(SQLiteDatabase db) {
         Log.v(TAG, "onConfigure() for " + mName);
+        // DiamaneOS: repair persistent SQL before any recovery or migration can delete rows.
+        com.android.providers.media.vmdecode.ThumbnailDeleteQueue.prepare(db, isExternal());
+        db.setCustomScalarFunction("_DIAMANEOS_THUMBNAIL_DELETE", value -> null);
 
         if (isExternal()) {
             db.setForeignKeyConstraintsEnabled(true);
@@ -529,6 +540,8 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
         mSchemaLock.writeLock().lock();
         try {
             updateDatabase(db, 0, mVersion);
+            // DiamaneOS: reconstruction installs only rollback-compatible cache SQL.
+            com.android.providers.media.vmdecode.ThumbnailDeleteQueue.prepare(db, isExternal());
         } finally {
             mSchemaLock.writeLock().unlock();
         }
@@ -549,6 +562,8 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
                 }
             }
             updateDatabase(db, oldV, newV);
+            // DiamaneOS: reconstruction installs only rollback-compatible cache SQL.
+            com.android.providers.media.vmdecode.ThumbnailDeleteQueue.prepare(db, isExternal());
         } finally {
             mSchemaLock.writeLock().unlock();
         }
@@ -560,6 +575,8 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
         mSchemaLock.writeLock().lock();
         try {
             downgradeDatabase(db, oldV, newV);
+            // DiamaneOS: reconstruction installs only rollback-compatible cache SQL.
+            com.android.providers.media.vmdecode.ThumbnailDeleteQueue.prepare(db, isExternal());
         } finally {
             mSchemaLock.writeLock().unlock();
         }
@@ -581,6 +598,10 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
         }
         tryRecoverRowIdSequence(db);
         tryMigrateFromLegacy(db);
+        // DiamaneOS: bind cache paths to this open before serving any thumbnail lookup.
+        com.android.providers.media.vmdecode.ThumbnailDeleteQueue.prepare(db, isExternal());
+        mThumbnailDeletes = com.android.providers.media.vmdecode.VmThumbnailDeletes.open(
+                mContext, db, isExternal());
     }
 
     public void tryRecoverPublicVolume(String volumeName) {
@@ -882,6 +903,8 @@ public class DatabaseHelper extends SQLiteOpenHelper implements AutoCloseable {
         mSchemaLock.readLock().unlock();
 
         if (state.successful) {
+            // DiamaneOS: the worker reads committed SQL and performs no filesystem work here.
+            if (mThumbnailDeletes != null) mThumbnailDeletes.wake();
             for (int i = 0; i < state.blockingTasks.size(); i++) {
                 state.blockingTasks.get(i).run();
             }

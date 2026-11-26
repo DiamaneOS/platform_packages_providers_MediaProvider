@@ -593,6 +593,58 @@ public class PickerUriResolverTest {
     }
 
     @Test
+    public void forwardedCloudThumbnailUsesTheGrantedSourceUserAndKeepsItsExtent() throws Exception {
+        final String authority = "test.picker.cloud";
+        final String mediaUser = "de.diamaneos.vmdecode.media_user";
+        final String later = "de.diamaneos.vmdecode.thumbnail_later";
+        final String status = "de.diamaneos.vmdecode.thumbnail_status";
+        final String orientation = android.provider.DocumentsContract.EXTRA_ORIENTATION;
+        final File bytes = File.createTempFile("picker-preview", ".jpg",
+                getTargetContext().getCacheDir());
+        try {
+            java.nio.file.Files.write(bytes.toPath(), new byte[] {0, 1, 2, 3});
+            for (int user : new int[] {UserHandle.myUserId(), TEST_USER}) {
+                final Uri granted = getPickerUriForIdWithCustomAuthority(7, user, ACTION_PICK_IMAGES,
+                        authority);
+                updateReadUriPermission(granted, true);
+                final Bundle extras = new Bundle();
+                extras.putInt(mediaUser, user + 1);
+                extras.putBoolean(later, true);
+                extras.putInt(status, 1);
+                extras.putInt(orientation, 90);
+                final android.content.ContentInterface provider =
+                        mock(android.content.ContentInterface.class);
+                final android.content.ContentResolver source =
+                        android.content.ContentResolver.wrap(provider);
+                try (ParcelFileDescriptor fd = ParcelFileDescriptor.open(bytes,
+                        ParcelFileDescriptor.MODE_READ_ONLY)) {
+                    when(provider.openTypedAssetFile(eq(Uri.parse("content://" + authority + "/media/7")),
+                            eq("image/*"), org.mockito.ArgumentMatchers.any(Bundle.class), eq(null)))
+                            .thenReturn(new AssetFileDescriptor(fd, 1, 2, extras));
+                    final PickerUriResolver resolver = new TestPickerUriResolver(sCurrentContext) {
+                        @Override android.content.ContentResolver getContentResolverForUserId(Uri uri) {
+                            assertThat(PickerUriResolver.getUserId(uri)).isEqualTo(user);
+                            return source;
+                        }
+                    };
+                    try (AssetFileDescriptor thumbnail = resolver.openTypedAssetFile(granted, "image/*",
+                            null, null, LocalCallingIdentity.forTest(sCurrentContext, -1, 0), true)) {
+                        assertThat(thumbnail.getParcelFileDescriptor()).isSameInstanceAs(fd);
+                        assertThat(thumbnail.getStartOffset()).isEqualTo(1);
+                        assertThat(thumbnail.getDeclaredLength()).isEqualTo(2);
+                        assertThat(thumbnail.getExtras().getInt(mediaUser)).isEqualTo(user);
+                        assertThat(thumbnail.getExtras().getInt(orientation)).isEqualTo(90);
+                        assertThat(thumbnail.getExtras().containsKey(later)).isFalse();
+                        assertThat(thumbnail.getExtras().containsKey(status)).isFalse();
+                    }
+                }
+            }
+        } finally {
+            java.nio.file.Files.deleteIfExists(bytes.toPath());
+        }
+    }
+
+    @Test
     public void testPickerUriResolver_pickerUri_fileOpenWithRequireOriginal() throws Exception {
         sTestPickerUri = getPickerUriForId(ContentUris.parseId(sMediaStoreUriInOtherContext),
                 TEST_USER, ACTION_PICK_IMAGES);

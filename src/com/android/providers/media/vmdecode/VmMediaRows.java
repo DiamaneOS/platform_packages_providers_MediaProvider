@@ -16,13 +16,16 @@
 package com.android.providers.media.vmdecode;
 
 import android.content.Context;
+import android.content.ContentResolver;
 import android.content.ContentUris;
 import android.content.res.AssetFileDescriptor;
 import android.content.pm.ProviderInfo;
 import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.net.Uri;
+import android.os.Binder;
 import android.os.CancellationSignal;
+import android.os.Bundle;
 import android.os.Environment;
 import android.os.UserHandle;
 import android.os.storage.StorageManager;
@@ -45,11 +48,79 @@ public final class VmMediaRows {
     public static final int IMAGE = 3;
     private static final String[] PROJECTION = {"_data", "owner_package_name", "_user_id",
             "generation_modified", "mime_type", "_display_name"};
-    private static final String CACHE = "vm-pixels-v2-u";
+    public static final String MEDIA_USER = "de.diamaneos.vmdecode.media_user";
+    private static final ThreadLocal<ThumbnailSource> THUMBNAIL = new ThreadLocal<>();
+
+    private static final class ThumbnailSource {
+        Source source;
+        Uri target;
+        boolean gone;
+        boolean retained;
+        final ThumbnailCacheFiles.Session externalSession = ThumbnailCacheFiles.session(true);
+        ThumbnailSource(Source source) { this.source = source; this.target = source == null ? null : source.rowUri; }
+        void accept(Source next) throws IOException {
+            if (source != null && !source.same(next)) {
+                throw new VmDecodeUnavailableException("Thumbnail row changed before publication");
+            }
+            source = next;
+            if (Objects.equals(target, next.rowUri)) gone = false;
+        }
+    }
+
+    public static AssetFileDescriptor thumbnailAsset(VmThumbnailErrors.Open open)
+            throws FileNotFoundException {
+        final ThumbnailSource previous = THUMBNAIL.get();
+        final ThumbnailSource capture = new ThumbnailSource(null);
+        THUMBNAIL.set(capture);
+        try {
+            final AssetFileDescriptor asset;
+            try {
+                asset = VmThumbnailErrors.open(open);
+            } catch (FileNotFoundException failure) {
+                if (capture.gone) return VmThumbnailErrors.gone();
+                throw failure;
+            }
+            if (capture.retained && capture.externalSession != ThumbnailCacheFiles.session(true)) {
+                try { asset.close(); } catch (IOException ignored) { }
+                return VmThumbnailErrors.later();
+            }
+            final Bundle extras = asset.getExtras() == null ? new Bundle() : new Bundle(asset.getExtras());
+            if (extras.getBoolean(VmThumbnailErrors.LATER)) return asset;
+            if (capture.source == null) {
+                try { asset.close(); } catch (IOException ignored) { }
+                throw new FileNotFoundException("No authenticated thumbnail row");
+            }
+            extras.putInt(MEDIA_USER, capture.source.user);
+            return new AssetFileDescriptor(asset.getParcelFileDescriptor(), asset.getStartOffset(),
+                    asset.getDeclaredLength(), extras);
+        } finally {
+            if (previous == null) THUMBNAIL.remove(); else THUMBNAIL.set(previous);
+        }
+    }
+
+    public static Runnable thumbnailWork(Runnable work) {
+        final ThumbnailSource current = THUMBNAIL.get();
+        if (current == null) return work;
+        final ThumbnailSource capture = new ThumbnailSource(current.source);
+        return () -> {
+            final ThumbnailSource previous = THUMBNAIL.get();
+            THUMBNAIL.set(capture);
+            try { work.run(); }
+            finally {
+                if (previous == null) THUMBNAIL.remove(); else THUMBNAIL.set(previous);
+            }
+        };
+    }
 
     public interface Query {
-        Cursor run(Uri uri, String[] projection, String selection, String[] arguments,
-                CancellationSignal signal) throws FileNotFoundException;
+        Cursor run(Uri uri, String[] projection, Bundle arguments, CancellationSignal signal) throws FileNotFoundException;
+    }
+
+    public static <T> Cursor asProvider(java.util.function.Supplier<T> clear,
+            java.util.function.Consumer<T> restore, java.util.function.Supplier<Cursor> query) {
+        final T token = clear.get();
+        try { return query.get(); }
+        finally { restore.accept(token); }
     }
 
     public static final class Source {
@@ -60,6 +131,7 @@ public final class VmMediaRows {
         public final String mimeType;
         public final String displayName;
         final Uri rowUri;
+        final ThumbnailCacheFiles.Session cacheSession;
         Source(String path, String principal, int user, long generation, Uri rowUri,
                 String mimeType, String displayName) {
             this.path = path;
@@ -69,23 +141,84 @@ public final class VmMediaRows {
             this.rowUri = rowUri;
             this.mimeType = mimeType;
             this.displayName = displayName;
+            this.cacheSession = ThumbnailCacheFiles.session(rowUri == null || rowUri.getPathSegments().isEmpty()
+                    || !"internal".equals(rowUri.getPathSegments().get(0)));
         }
         boolean same(Source other) {
-            return other != null && user == other.user && generation == other.generation
+            return other != null && cacheSession == other.cacheSession
+                    && user == other.user && generation == other.generation
                     && Objects.equals(path, other.path) && Objects.equals(principal, other.principal);
         }
     }
 
     static Source row(Query query, Uri uri, CancellationSignal signal) throws IOException {
-        try (Cursor cursor = query.run(uri, PROJECTION, null, null, signal)) {
-            if (cursor == null || cursor.getCount() != 1 || !cursor.moveToFirst()
-                    || cursor.isNull(0) || cursor.isNull(2)) {
+        return row(query, uri, signal, false);
+    }
+
+    private static Source row(Query query, Uri uri, CancellationSignal signal, boolean includeDetached)
+            throws IOException {
+        final ThumbnailSource attempt = THUMBNAIL.get();
+        if (attempt != null && attempt.target == null) attempt.target = uri;
+        final ThumbnailCacheFiles.Session session = ThumbnailCacheFiles.session(
+                uri == null || uri.getPathSegments().isEmpty()
+                        || !"internal".equals(uri.getPathSegments().get(0)));
+        final Uri collection;
+        final String id;
+        final String volume;
+        try {
+            if (!"content".equals(uri.getScheme()) || !MediaStore.AUTHORITY.equals(uri.getHost())) {
+                throw new IllegalArgumentException("Not a media row URI");
+            }
+            final long rowId = ContentUris.parseId(uri);
+            if (rowId < 0) throw new IllegalArgumentException("Negative media row ID");
+            id = Long.toString(rowId);
+            // The files collection exposes the authenticated row user, item projections do not.
+            final Uri unqualified = uri.buildUpon().authority(MediaStore.AUTHORITY).build();
+            volume = MediaStore.getVolumeName(unqualified);
+            collection = MediaStore.Files.getContentUri(includeDetached
+                    ? MediaStore.VOLUME_EXTERNAL : volume).buildUpon()
+                    .encodedAuthority(uri.getEncodedAuthority()).build();
+        } catch (IllegalArgumentException | UnsupportedOperationException invalid) {
+            throw new IOException("Invalid media row URI", invalid);
+        }
+        final Bundle arguments = new Bundle();
+        final boolean namedDetached = includeDetached && !MediaStore.VOLUME_EXTERNAL.equals(volume);
+        arguments.putString(ContentResolver.QUERY_ARG_SQL_SELECTION,
+                namedDetached ? "_id=? AND volume_name=?" : "_id=?");
+        arguments.putStringArray(ContentResolver.QUERY_ARG_SQL_SELECTION_ARGS,
+                namedDetached ? new String[] {id, volume} : new String[] {id});
+        // Item lookups include pending and trashed rows while retaining provider access checks.
+        arguments.putInt(MediaStore.QUERY_ARG_MATCH_PENDING, MediaStore.MATCH_INCLUDE);
+        arguments.putInt(MediaStore.QUERY_ARG_MATCH_TRASHED, MediaStore.MATCH_INCLUDE);
+        if (includeDetached) {
+            arguments.putBoolean(MediaStore.QUERY_ARG_INCLUDE_RECENTLY_UNMOUNTED_VOLUMES, true);
+        }
+        try (Cursor cursor = query.run(collection, PROJECTION, arguments, signal)) {
+            if (cursor == null) throw new VmDecodeUnavailableException("Media row query unavailable");
+            if (session != ThumbnailCacheFiles.session(session.external)) {
+                throw new VmDecodeUnavailableException("Thumbnail row crossed a database reopen");
+            }
+            if (cursor.getCount() == 0) {
+                if (includeDetached) throw new VmDecodeUnavailableException("Media row absence uncertain");
+                if (attempt != null && Objects.equals(attempt.target, uri)) attempt.gone = true;
+                throw new VmMediaGoneException("Media row no longer exists");
+            }
+            if (cursor.getCount() != 1 || !cursor.moveToFirst() || cursor.isNull(0) || cursor.isNull(2)) {
                 throw new FileNotFoundException("No authenticated media row");
             }
             final int user = cursor.getInt(2);
             if (user < 0) throw new FileNotFoundException("No media source user");
-            return new Source(cursor.getString(0), cursor.getString(1), user, cursor.getLong(3), uri,
+            if (includeDetached && (cursor.isNull(3) || cursor.getString(0).isEmpty())) {
+                throw new VmDecodeUnavailableException("Retained row identity unavailable");
+            }
+            final Source source = new Source(cursor.getString(0), cursor.getString(1), user, cursor.getLong(3), uri,
                     cursor.getString(4), cursor.getString(5));
+            if (source.cacheSession != session) {
+                throw new VmDecodeUnavailableException("Thumbnail row crossed a database reopen");
+            }
+            final ThumbnailSource capture = THUMBNAIL.get();
+            if (capture != null) capture.accept(source);
+            return source;
         }
     }
 
@@ -104,29 +237,55 @@ public final class VmMediaRows {
     }
 
     public static File cacheFile(Query query, Uri uri, UserCache users, String directory) throws IOException {
-        final Source source = row(query, uri, null);
+        final ThumbnailSource attempt = THUMBNAIL.get();
+        Source source;
+        boolean retained = false;
+        try {
+            source = row(query, uri, null);
+        } catch (VmMediaGoneException | IllegalArgumentException failure) {
+            // Only the initial authorized image or video lookup can reuse a detached row.
+            if (attempt == null || attempt.source != null || !Objects.equals(attempt.target, uri)
+                    || !("Pictures".equals(directory) || "Movies".equals(directory))) throw failure;
+            final String volume = MediaStore.getVolumeName(uri);
+            if (MediaStore.VOLUME_INTERNAL.equals(volume)
+                    || MediaStore.VOLUME_EXTERNAL_PRIMARY.equals(volume)) throw failure;
+            if (failure instanceof IllegalArgumentException
+                    && (MediaStore.VOLUME_EXTERNAL.equals(volume)
+                    || !("Volume " + volume + " not found").equals(failure.getMessage()))) throw failure;
+            attempt.gone = false;
+            // The provider's compat state enables retained rows for this already authorized open.
+            final long caller = Binder.clearCallingIdentity();
+            try {
+                source = row(query, uri, null, true);
+            } finally {
+                Binder.restoreCallingIdentity(caller);
+            }
+            retained = true;
+        }
         final Context context = users.getContextForUser(UserHandle.of(source.user));
         final File storage = context.getSystemService(StorageManager.class).getPrimaryStorageVolume().getDirectory();
         if (storage == null) throw new IOException("No media thumbnail volume");
-        return FileUtils.buildPath(storage, directory, ".thumbnails", CACHE + source.user,
-                ContentUris.parseId(uri) + ".jpg");
+        final File file = ThumbnailCacheFiles.file(storage, directory, source.user,
+                ContentUris.parseId(uri), source.generation, source.cacheSession);
+        if (retained && (source.cacheSession != attempt.externalSession
+                || !ThumbnailCacheFiles.regular(file))) {
+            throw new VmDecodeUnavailableException("Retained row has no current warm thumbnail");
+        }
+        if (retained) attempt.retained = true;
+        return file;
     }
 
     public static List<File> cacheDirectories(File volume, List<UserHandle> users) {
         final List<File> directories = new ArrayList<>();
         for (UserHandle user : users) {
-            for (String kind : new String[] {Environment.DIRECTORY_MUSIC, Environment.DIRECTORY_MOVIES,
-                    Environment.DIRECTORY_PICTURES}) {
-                directories.add(FileUtils.buildPath(volume, kind, ".thumbnails", CACHE + user.getIdentifier()));
-            }
+            directories.addAll(ThumbnailCacheFiles.directories(volume, user.getIdentifier()));
         }
         return directories;
     }
 
     public static Source forDisplay(android.content.ContentResolver resolver, Uri uri,
             CancellationSignal signal) throws IOException {
-        return row((address, columns, selection, args, cancel) ->
-                resolver.query(address, columns, selection, args, null, cancel), uri, signal);
+        return row(resolver::query, uri, signal);
     }
 
     static int uriUser(Context context, Uri uri) {
@@ -138,19 +297,18 @@ public final class VmMediaRows {
     static Source picker(Context context, Uri uri) throws IOException {
         final int user = uriUser(context, uri);
         if (!VmMediaUsers.serves(context, user)) throw new SecurityException("Unserved picker source user");
-        if (PickerSyncController.LOCAL_PICKER_PROVIDER_AUTHORITY.equals(uri.getHost())) {
+        final String authority = ProviderAuthority.picker(uri);
+        if (PickerSyncController.LOCAL_PICKER_PROVIDER_AUTHORITY.equals(authority)) {
             final long id;
             try { id = Long.parseLong(uri.getLastPathSegment()); }
             catch (RuntimeException e) { throw new IOException("Invalid picker media id", e); }
-            final Uri item = MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL, id).buildUpon()
-                    .authority(user + "@" + MediaStore.AUTHORITY).build();
-            final Source source = row((address, columns, selection, args, signal) ->
-                    context.getContentResolver().query(address, columns, selection, args, null, signal), item, null);
+            final Uri item = pickerItem(user, id);
+            final Source source = row(context.getContentResolver()::query, item, null);
             if (!VmMediaUsers.serves(context, source.user)) throw new SecurityException("Unserved media row user");
             return source;
         }
         final ProviderInfo provider = VmMediaUsers.contextForUser(context, user)
-                .getPackageManager().resolveContentProvider(uri.getHost(), 0);
+                .getPackageManager().resolveContentProvider(authority, 0);
         if (provider == null || provider.packageName == null) throw new IOException("No selected media provider");
         return new Source(null, provider.packageName, user, -1, null, null, null);
     }
@@ -159,5 +317,10 @@ public final class VmMediaRows {
         if (!source.same(picker(context, uri))) {
             throw new VmDecodeUnavailableException("Media row changed during source open");
         }
+    }
+
+    static Uri pickerItem(int user, long id) {
+        return MediaStore.Files.getContentUri(MediaStore.VOLUME_EXTERNAL, id).buildUpon()
+                .encodedAuthority(user + "@" + MediaStore.AUTHORITY).build();
     }
 }

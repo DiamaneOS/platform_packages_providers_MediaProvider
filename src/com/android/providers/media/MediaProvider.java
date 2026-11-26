@@ -9834,7 +9834,7 @@ public class MediaProvider extends ContentProvider {
         private File getThumbnailFile(Uri uri) throws IOException {
             // DiamaneOS: versioned thumbnail storage follows the authenticated row user.
             return com.android.providers.media.vmdecode.VmMediaRows.cacheFile(
-                    MediaProvider.this::queryForSingleItemAsMediaProvider, uri, mUserCache, directoryName);
+                    MediaProvider.this::queryVmMediaRow, uri, mUserCache, directoryName);
         }
 
         public abstract Bitmap getThumbnailBitmap(Uri uri, CancellationSignal signal)
@@ -9889,7 +9889,8 @@ public class MediaProvider extends ContentProvider {
                         ParcelFileDescriptor.MODE_READ_ONLY);
 
                 final Bitmap thumbnail = getThumbnailBitmap(uri, signal);
-                thumbnail.compress(Bitmap.CompressFormat.JPEG, 90,
+                // DiamaneOS: an incomplete encode never becomes the cached thumbnail.
+                com.android.providers.media.vmdecode.ThumbnailEncoding.jpeg(thumbnail,
                         new FileOutputStream(thumbWrite.getFileDescriptor()));
 
                 try {
@@ -9923,15 +9924,18 @@ public class MediaProvider extends ContentProvider {
             final LocalCallingIdentity callerIdentity = mCallingIdentity.get();
 
             try {
-                ThumbnailBackgroundThread.getExecutor().execute(() ->
-                        backgroundThumbnailWorker(uri, signal, writeFd, callerIdentity));
+                // DiamaneOS: retain the authenticated row identity across the async thumbnail work.
+                ThumbnailBackgroundThread.getExecutor().execute(
+                        com.android.providers.media.vmdecode.VmMediaRows.thumbnailWork(() ->
+                        backgroundThumbnailWorker(uri, signal, writeFd, callerIdentity)));
                 return readFd;
             } catch (RejectedExecutionException e) {
                 // Terminate the pipe and fail the request.
                 FileUtils.closeQuietly(readFd);
                 FileUtils.closeQuietly(writeFd);
                 Log.e(TAG, "Thumbnail queue saturated. Request rejected for " + uri);
-                throw new IOException("Thumbnail generation pool saturated", e);
+                // DiamaneOS: callers keep the transient queue-refusal reason.
+                throw com.android.providers.media.vmdecode.VmThumbnailErrors.busy(e);
             }
         }
 
@@ -9941,29 +9945,11 @@ public class MediaProvider extends ContentProvider {
         private void backgroundThumbnailWorker(Uri uri, CancellationSignal signal,
                 ParcelFileDescriptor writeFd, LocalCallingIdentity callerIdentity) {
             final LocalCallingIdentity token = clearLocalCallingIdentity(callerIdentity);
-            File tempFile = null;
-
-            try (OutputStream pipeOut = new ParcelFileDescriptor.AutoCloseOutputStream(writeFd)) {
-                final Bitmap bitmap = getThumbnailBitmap(uri, signal);
-                if (bitmap == null) {
-                    throw new IOException("Bitmap generation failed");
-                }
-
-                final File thumbFile = getThumbnailFile(uri);
-                final File thumbDir = thumbFile.getParentFile();
-                thumbDir.mkdirs();
-
-                tempFile = File.createTempFile("thumb", null, thumbDir);
-                try (FileOutputStream fos = new FileOutputStream(tempFile)) {
-                    bitmap.compress(Bitmap.CompressFormat.JPEG, 90, fos);
-                }
-
-                Os.rename(tempFile.getAbsolutePath(), thumbFile.getAbsolutePath());
-                tempFile = null;
-
-                try (FileInputStream fis = new FileInputStream(thumbFile)) {
-                    FileUtils.copy(fis, pipeOut);
-                }
+            try {
+                // DiamaneOS: encode and report reliable-pipe failures before closing the output.
+                com.android.providers.media.vmdecode.ThumbnailEncoding.publish(writeFd,
+                        () -> getThumbnailBitmap(uri, signal), () -> getThumbnailFile(uri),
+                        MediaProvider.this::deleteAndInvalidate);
             } catch (Exception e) {
                 Log.e(TAG, "Async thumbnail failed for " + uri, e);
                 try {
@@ -9971,9 +9957,6 @@ public class MediaProvider extends ContentProvider {
                 } catch (IOException ignored) {
                 }
             } finally {
-                if (tempFile != null) {
-                    deleteAndInvalidate(tempFile);
-                }
                 restoreLocalCallingIdentity(token);
             }
         }
@@ -9988,7 +9971,7 @@ public class MediaProvider extends ContentProvider {
         public Bitmap getThumbnailBitmap(Uri uri, CancellationSignal signal) throws IOException {
             // DiamaneOS: keep the file, supplying package and source user in one row snapshot.
             return com.android.providers.media.vmdecode.VmMediaRows.thumbnail(
-                    MediaProvider.this::queryForSingleItemAsMediaProvider, uri, mThumbSize, signal,
+                    MediaProvider.this::queryVmMediaRow, uri, mThumbSize, signal,
                     com.android.providers.media.vmdecode.VmMediaRows.AUDIO);
         }
     };
@@ -9998,7 +9981,7 @@ public class MediaProvider extends ContentProvider {
         public Bitmap getThumbnailBitmap(Uri uri, CancellationSignal signal) throws IOException {
             // DiamaneOS: keep the file, supplying package and source user in one row snapshot.
             return com.android.providers.media.vmdecode.VmMediaRows.thumbnail(
-                    MediaProvider.this::queryForSingleItemAsMediaProvider, uri, mThumbSize, signal,
+                    MediaProvider.this::queryVmMediaRow, uri, mThumbSize, signal,
                     com.android.providers.media.vmdecode.VmMediaRows.VIDEO);
         }
     };
@@ -10008,7 +9991,7 @@ public class MediaProvider extends ContentProvider {
         public Bitmap getThumbnailBitmap(Uri uri, CancellationSignal signal) throws IOException {
             // DiamaneOS: keep the file, supplying package and source user in one row snapshot.
             return com.android.providers.media.vmdecode.VmMediaRows.thumbnail(
-                    MediaProvider.this::queryForSingleItemAsMediaProvider, uri, mThumbSize, signal,
+                    MediaProvider.this::queryVmMediaRow, uri, mThumbSize, signal,
                     com.android.providers.media.vmdecode.VmMediaRows.IMAGE);
         }
     };
@@ -11382,8 +11365,9 @@ public class MediaProvider extends ContentProvider {
 
         // Offer thumbnail of media, when requested
         if (wantsThumb) {
-            final ParcelFileDescriptor pfd = ensureThumbnail(uri, signal);
-            return new AssetFileDescriptor(pfd, 0, AssetFileDescriptor.UNKNOWN_LENGTH);
+            // DiamaneOS: carry the authenticated row user and typed first-hop failure.
+            return com.android.providers.media.vmdecode.VmMediaRows.thumbnailAsset(
+                    () -> ensureThumbnail(uri, signal));
         }
 
         // Worst case, return the underlying file
@@ -11593,6 +11577,14 @@ public class MediaProvider extends ContentProvider {
                 MediaColumns.DATA + "=?", new String[] { file.getAbsolutePath() }, signal)) {
             return ContentUris.withAppendedId(uri, cursor.getLong(0));
         }
+    }
+
+    // DiamaneOS: keep row identity queries scoped to MediaProvider with explicit item visibility.
+    private Cursor queryVmMediaRow(Uri uri, String[] projection, Bundle arguments,
+            CancellationSignal signal) {
+        return com.android.providers.media.vmdecode.VmMediaRows.asProvider(
+                this::clearLocalCallingIdentity, this::restoreLocalCallingIdentity,
+                () -> query(uri, projection, arguments, signal, true));
     }
 
     /**

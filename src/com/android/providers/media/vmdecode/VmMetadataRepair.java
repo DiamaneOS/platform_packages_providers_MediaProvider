@@ -44,6 +44,7 @@ public final class VmMetadataRepair {
 
     public static void run(Context context, DatabaseHelper database, PickerDbFacade picker,
             CancellationSignal signal) {
+        VmThumbnailDeletes.idle();
         final SharedPreferences prefs = context.getSharedPreferences("diamaneos_vm_metadata_repair",
                 Context.MODE_PRIVATE);
         final MetadataRepairPass.Store store = new MetadataRepairPass.Store() {

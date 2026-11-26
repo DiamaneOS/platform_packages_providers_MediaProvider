@@ -493,36 +493,17 @@ public final class VmDecode {
     // The asset as the service takes it: a FUSE file or a part of a file through a memory file, else as it is.
     private static <T> T withAsset(AssetFileDescriptor asset, @Nullable String owner, WithFile<T> work)
             throws IOException {
-        final ParcelFileDescriptor pfd = asset.getParcelFileDescriptor();
-        final long offset = asset.getStartOffset();
-        final long length = asset.getDeclaredLength();
-        if (SourceReader.onFuse(pfd)) {
-            // Even a stat can stall on FUSE: everything happens on a reader thread with a deadline, and the
-            // service gets a memory file.
-            final byte[] bytes = SourceReader.read(pfd, offset, length, IDecodeService.MAX_BUFFERED_BYTES, false,
-                    owner, COPY_DEADLINE_MILLIS);
-            try (ParcelFileDescriptor memory = memoryFile(bytes, bytes.length)) {
-                return work.run(memory);
-            }
+        final Bundle sourceExtras = asset.getExtras();
+        final boolean sourceLater = sourceExtras != null && sourceExtras.getBoolean(VmThumbnailErrors.LATER);
+        if (sourceExtras != null) sourceExtras.clear();
+        if (sourceLater) {
+            countUnavailable();
+            throw new VmDecodeUnavailableException("Thumbnail source temporarily unavailable");
         }
-        final StructStat st;
-        try {
-            st = Os.fstat(pfd.getFileDescriptor());
-        } catch (ErrnoException e) {
-            throw new IOException("asset not readable", e);
-        }
-        final boolean regular = OsConstants.S_ISREG(st.st_mode);
-        if (!regular || (offset == 0 && (length < 0 || length == st.st_size))) {
-            if (!regular && offset != 0) {
-                throw new VmDecodeRejectedException("offset into a stream");
-            }
-            return work.run(pfd);
-        }
-        if (length < 0 || length > IDecodeService.MAX_BUFFERED_BYTES || offset < 0) {
-            throw new VmDecodeRejectedException("asset part out of range");
-        }
-        try (ParcelFileDescriptor part = copyToMemory(pfd.getFileDescriptor(), offset, (int) length)) {
-            return work.run(part);
+        try (ParcelFileDescriptor prepared = SourceReader.prepareAsset(asset, principal(owner))) {
+            return work.run(prepared);
+        } catch (IOException failure) {
+            throw VmThumbnailErrors.classify(failure);
         }
     }
 
@@ -548,21 +529,17 @@ public final class VmDecode {
      * afterwards, so nothing else may pass here.
      */
     static void checkPickerUri(Context context, Uri uri, int pid, int uid) {
-        final String host = uri.getHost();
-        final String user = uri.getUserInfo();
-        final java.util.List<String> path = uri.getPathSegments();
+        final String authority = ProviderAuthority.picker(uri);
         String cloud = null;
         try {
             cloud = PickerSyncController.getInstanceOrThrow().getCloudProvider();
         } catch (IllegalStateException e) {
             // No picker data layer: only the local provider.
         }
-        final boolean provider = PickerSyncController.LOCAL_PICKER_PROVIDER_AUTHORITY.equals(host)
-                || (cloud != null && cloud.equals(host));
+        final boolean provider = PickerSyncController.LOCAL_PICKER_PROVIDER_AUTHORITY.equals(authority)
+                || (cloud != null && cloud.equals(authority));
         final boolean sameUser = VmMediaUsers.serves(context, VmMediaRows.uriUser(context, uri));
-        if (!ContentResolver.SCHEME_CONTENT.equals(uri.getScheme()) || !provider || !sameUser
-                || path.size() != 2 || !"media".equals(path.get(0)) || uri.getQuery() != null
-                || uri.getFragment() != null
+        if (!provider || !sameUser
                 || context.checkContentUriPermissionFull(uri, pid, uid, android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
                         != android.content.pm.PackageManager.PERMISSION_GRANTED) {
             throw new SecurityException("not a picker item the caller may read");
@@ -630,7 +607,7 @@ public final class VmDecode {
                 }
                 // In the file's colour space, as Android's decode gives it (sRGB or Display P3).
                 final Bitmap bitmap = Bitmap.createBitmap(reply.width, reply.height, Bitmap.Config.ARGB_8888,
-                        true, DecodeChecks.colorSpaceOf(reply));
+                        true, checkedColour(reply.colorSpace, reply.colorDescription));
                 bitmap.copyPixelsFromBuffer(ByteBuffer.wrap(frame));
                 // Ultra HDR: the gain map, every stripe checked, attached as Android's decode attaches it, so a
                 // thumbnail encoded from this bitmap keeps it.
@@ -795,5 +772,25 @@ public final class VmDecode {
         } catch (ErrnoException e) {
             throw new FileNotFoundException(file + ": " + e.getMessage());
         }
+    }
+
+    // A checked reply's wire colour (DecodeChecks validated it) as a public ColorSpace, as the framework's
+    // GateColorSpaces builds it. The module SDK cannot see that hidden class.
+    private static android.graphics.ColorSpace checkedColour(int value, float[] description) {
+        final android.graphics.ColorSpace.Named[] named = {android.graphics.ColorSpace.Named.SRGB,
+                android.graphics.ColorSpace.Named.DISPLAY_P3, android.graphics.ColorSpace.Named.ADOBE_RGB,
+                android.graphics.ColorSpace.Named.PRO_PHOTO_RGB, android.graphics.ColorSpace.Named.BT2020,
+                android.graphics.ColorSpace.Named.BT2020_HLG, android.graphics.ColorSpace.Named.BT2020_PQ,
+                android.graphics.ColorSpace.Named.LINEAR_SRGB};
+        if (value >= 0 && value < named.length) return android.graphics.ColorSpace.get(named[value]);
+        if (value != 8 || description == null || description.length != 16) {
+            throw new IllegalArgumentException("unchecked colour " + value);
+        }
+        final float[] xyz = java.util.Arrays.copyOf(description, 9);
+        final android.graphics.ColorSpace.Rgb.TransferParameters transfer =
+                new android.graphics.ColorSpace.Rgb.TransferParameters(description[9], description[10],
+                        description[11], description[12], description[13], description[14], description[15]);
+        final android.graphics.ColorSpace matched = android.graphics.ColorSpace.match(xyz, transfer);
+        return matched != null ? matched : new android.graphics.ColorSpace.Rgb("Unknown", xyz, transfer);
     }
 }

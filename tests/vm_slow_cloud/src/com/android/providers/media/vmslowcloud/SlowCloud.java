@@ -17,13 +17,21 @@ import java.io.FileNotFoundException;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public final class SlowCloud extends CloudMediaProvider {
+    static volatile java.util.concurrent.CountDownLatch held;
     static final AtomicInteger checks = new AtomicInteger();
     static final AtomicInteger opens = new AtomicInteger();
+    static final AtomicInteger active = new AtomicInteger();
     @Override public boolean onCreate() { return true; }
     @Override public int checkUriPermission(Uri uri, int uid, int modes) {
         checks.incrementAndGet();
-        SystemClock.sleep(1500);
-        return PackageManager.PERMISSION_DENIED;
+        active.incrementAndGet();
+        try {
+            final java.util.concurrent.CountDownLatch wait = held;
+            if (wait == null) SystemClock.sleep(1500);
+            else try { wait.await(30, java.util.concurrent.TimeUnit.SECONDS); }
+            catch (InterruptedException failure) { Thread.currentThread().interrupt(); }
+            return PackageManager.PERMISSION_DENIED;
+        } finally { active.decrementAndGet(); }
     }
     @Override public Cursor onQueryMedia(Bundle extras) {
         return new MatrixCursor(new String[] {CloudMediaProviderContract.MediaColumns.ID,
