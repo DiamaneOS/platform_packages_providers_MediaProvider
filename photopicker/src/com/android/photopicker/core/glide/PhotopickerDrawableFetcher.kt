@@ -65,23 +65,22 @@ class PhotopickerDrawableFetcher(private val model: GlideLoadable, private val c
 
             var badgedIcon: Drawable? = null
 
+            // Another app's image is only loaded where the system's clean copy gate covers it: a system app.
+            if ((context.applicationInfo.flags and ApplicationInfo.FLAG_SYSTEM) == 0) {
+                callback.onLoadFailed(FileNotFoundException("Not a system app: $uri not loaded"))
+                return
+            }
             packageName?.let {
                 val contextForPackage =
                     context.createPackageContextAsUser(packageName, 0, userHandle)
-                // DiamaneOS: image files of an app outside the system image (a cloud media
-                // provider's icon) would be decoded in this process. Only icons of the verified
-                // system image load here, the others are not shown.
-                val info = contextForPackage.applicationInfo
-                if (
-                    info.flags and ApplicationInfo.FLAG_SYSTEM == 0 ||
-                        info.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP != 0
-                ) {
-                    callback.onLoadFailed(
-                        FileNotFoundException("Icon of $packageName is not from the system image")
+                // Through the package manager: with clean copies, a missing one gives null (and nothing kept), so the
+                // load fails and is tried again later instead of a blank badge staying in Glide's cache.
+                val icon =
+                    contextForPackage.packageManager.getDrawable(
+                        packageName,
+                        resourceId,
+                        contextForPackage.applicationInfo,
                     )
-                    return
-                }
-                val icon = contextForPackage.getDrawable(resourceId)
                 icon?.let {
                     badgedIcon = context.packageManager.getUserBadgedIcon(icon, userHandle)
                 }
