@@ -135,6 +135,131 @@ public class ModernMediaScannerTest {
     }
 
     @Test
+    public void rowlessFileRecoversAutomaticallyAfterTwoParserRefusals() throws Exception {
+        automaticRetry("automatic-parser-retry.mp3", R.raw.test_audio, "duration");
+    }
+
+    @Test
+    public void newPhotoRecoversAutomaticallyAfterTwoParserRefusals() throws Exception {
+        automaticRetry("automatic-parser-retry.jpg", R.raw.test_image, "width");
+    }
+
+    @Test
+    public void exactRetryDoesNotScanAReplacementDirectory() throws Exception {
+        final File target = new File(mDir, "replaced.jpg");
+        stage(R.raw.test_image, target);
+        final VmFillIns retry = exactRetry();
+        retry.add(target);
+        assertTrue(target.delete());
+        assertTrue(target.mkdir());
+        final File child = new File(target, "child.jpg");
+        stage(R.raw.test_image, child);
+        retry.run();
+        try (Cursor row = mIsolatedResolver.query(MediaStore.Files.getContentUri("external"),
+                new String[] {"_id"}, "_data=?", new String[] {child.getAbsolutePath()}, null)) {
+            assertEquals(0, row.getCount());
+        }
+    }
+
+    @Test
+    public void unavailableExactRetryKeepsCheckedGifFields() throws Exception {
+        final File gif = new File(mDir, "checked.gif");
+        stage(R.raw.test_gif, gif);
+        final Uri row = mModern.scanFile(gif, MediaScanner.REASON_IDLE);
+        assertNotNull(row);
+        final int[] checked = checkedImageFields(row);
+        assertTrue(checked[0] > 0 && checked[1] > 0);
+        final Class<?> decode = com.android.providers.media.vmdecode.VmDecode.class;
+        final var probes = decode.getDeclaredField("sProbeCache");
+        probes.setAccessible(true);
+        ((android.util.LruCache<?, ?>) probes.get(null)).evictAll();
+        final VmFillIns retry = exactRetry();
+        retry.add(gif);
+        int before = com.android.providers.media.vmdecode.VmDecode.unavailableCount();
+        try (var expired = com.android.providers.media.vmdecode.VmDecode.boundUntil(
+                android.os.SystemClock.uptimeMillis() - 1, null, null)) {
+            retry.run();
+        }
+        assertTrue(com.android.providers.media.vmdecode.VmDecode.unavailableCount() > before);
+        org.junit.Assert.assertArrayEquals(checked, checkedImageFields(row));
+        final var ledger = VmFillIns.class.getDeclaredField("ledger");
+        ledger.setAccessible(true);
+        assertTrue(((ScanRetryLedger) ledger.get(retry)).pending());
+    }
+
+    private VmFillIns exactRetry() throws Exception {
+        final var fillIn = ModernMediaScanner.class.getDeclaredMethod("fillIn", File.class);
+        fillIn.setAccessible(true);
+        return new VmFillIns(file -> {
+            try { return (boolean) fillIn.invoke(mModern, file); }
+            catch (ReflectiveOperationException failure) { throw new AssertionError(failure); }
+        }, mock(android.os.Handler.class));
+    }
+
+    private int[] checkedImageFields(Uri uri) {
+        try (Cursor row = mIsolatedResolver.query(uri, new String[] {"width", "height",
+                FileColumns._SPECIAL_FORMAT}, null, null, null)) {
+            assertTrue(row.moveToFirst());
+            assertFalse(row.isNull(2));
+            return new int[] {row.getInt(0), row.getInt(1), row.getInt(2)};
+        }
+    }
+
+    private void automaticRetry(String name, int resource, String metadata) throws Exception {
+        final File file = new File(mDir, name);
+        stage(resource, file);
+        final Class<?> reader = Class.forName("com.android.providers.media.vmdecode.SourceReader");
+        final java.lang.reflect.Field field = reader.getDeclaredField("sBudget");
+        field.setAccessible(true);
+        final Object budget = field.get(null);
+        final java.lang.reflect.Method reserve = budget.getClass().getDeclaredMethod("reserve", String.class, long.class);
+        reserve.setAccessible(true);
+        final java.util.concurrent.CountDownLatch retried = new java.util.concurrent.CountDownLatch(1);
+        final java.lang.reflect.Field retries = ModernMediaScanner.class.getDeclaredField("mFillIns");
+        retries.setAccessible(true);
+        final Object fillIns = retries.get(mModern);
+        final java.lang.reflect.Field callback;
+        java.lang.reflect.Field found;
+        try { found = fillIns.getClass().getDeclaredField("scan"); }
+        catch (NoSuchFieldException previousBuild) { found = fillIns.getClass().getDeclaredField("mScan"); }
+        callback = found;
+        callback.setAccessible(true);
+        final java.util.function.Predicate<File> production =
+                (java.util.function.Predicate<File>) callback.get(fillIns);
+        callback.set(fillIns, (java.util.function.Predicate<File>) candidate -> {
+            try { return production.test(candidate); }
+            finally { if (candidate.equals(file)) retried.countDown(); }
+        });
+        final java.util.List<AutoCloseable> tickets = new java.util.ArrayList<>();
+        try {
+            for (int slot = 0; slot < 3; slot++) {
+                final AutoCloseable ticket = (AutoCloseable) reserve.invoke(budget,
+                        "automatic-pressure-" + slot, 40L * 1024 * 1024);
+                assertNotNull(ticket);
+                tickets.add(ticket);
+            }
+            assertEquals(null, mModern.scanFile(file, MediaScanner.REASON_DEMAND));
+            // Observe the real scheduled callback before releasing parser pressure.
+            assertTrue("The actual fill-in did not retry while parser pressure remained held",
+                    retried.await(30, java.util.concurrent.TimeUnit.SECONDS));
+            try (Cursor cursor = mIsolatedResolver.query(MediaStore.Files.getContentUri("external"),
+                    new String[] {"_id"}, "_data=?", new String[] {file.getAbsolutePath()}, null)) {
+                assertEquals(0, cursor.getCount());
+            }
+        } finally { for (AutoCloseable ticket : tickets) ticket.close(); }
+        final long end = android.os.SystemClock.uptimeMillis() + 30_000;
+        boolean indexed = false;
+        while (android.os.SystemClock.uptimeMillis() < end) {
+            try (Cursor cursor = mIsolatedResolver.query(MediaStore.Files.getContentUri("external"),
+                    new String[] {metadata}, "_data=?", new String[] {file.getAbsolutePath()}, null)) {
+                if (cursor.moveToFirst() && cursor.getLong(0) > 0) { indexed = true; break; }
+            }
+            android.os.SystemClock.sleep(100);
+        }
+        assertTrue("The automatic worker lost the rowless file after its second refusal", indexed);
+    }
+
+    @Test
     public void parserPressureDefersNormalScanAndRetriesAllMetadata() throws Exception {
         final File file = new File(mDir, "parser-pressure.mp3");
         stage(R.raw.test_audio, file);
@@ -168,7 +293,7 @@ public class ModernMediaScannerTest {
                         com.android.providers.media.vmdecode.MetadataAdmission.Pressure);
             }
         } finally { for (AutoCloseable ticket : tickets) ticket.close(); }
-        final Uri result = mModern.scanFile(file, REASON_DEMAND);
+        final Uri result = mModern.scanFile(file, MediaScanner.REASON_DEMAND);
         assertNotNull(result);
         try (Cursor cursor = mIsolatedResolver.query(result,
                 new String[] {MediaStore.Audio.AudioColumns.DURATION}, null, null, null)) {
