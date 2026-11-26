@@ -20,7 +20,7 @@ import android.content.ContentResolver
 import com.bumptech.glide.load.model.ModelLoader
 import com.bumptech.glide.load.model.ModelLoaderFactory
 import com.bumptech.glide.load.model.MultiModelLoaderFactory
-import java.io.InputStream
+import com.android.providers.media.vmdecode.frames.PickerImage
 
 /**
  * A factory class responsible for instantiating the [PhotopickerModelLoader].
@@ -30,13 +30,13 @@ import java.io.InputStream
  * @property contentResolver the [ContentResolver] this ModelLoader and it's workers should use.
  */
 class PhotopickerModelLoaderFactory(val contentResolver: ContentResolver) :
-    ModelLoaderFactory<GlideLoadable, InputStream> {
+    ModelLoaderFactory<GlideLoadable, PickerImage> {
 
     /**
      * Glide will call this once during initialization to get an instance of the ModelLoader for the
      * [GlideLoadable] registration.
      */
-    override fun build(unused: MultiModelLoaderFactory): ModelLoader<GlideLoadable, InputStream> {
+    override fun build(unused: MultiModelLoaderFactory): ModelLoader<GlideLoadable, PickerImage> {
         return PhotopickerModelLoader(contentResolver)
     }
 

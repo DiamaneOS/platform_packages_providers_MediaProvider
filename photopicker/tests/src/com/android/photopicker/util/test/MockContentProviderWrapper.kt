@@ -20,6 +20,9 @@ import android.content.ContentProvider
 import android.content.ContentResolver
 import android.content.res.AssetFileDescriptor
 import android.graphics.Point
+import android.graphics.BitmapFactory
+import android.os.ResultReceiver
+import com.android.providers.media.vmdecode.frames.PickerImageClient
 import android.net.Uri
 import android.os.Bundle
 import android.os.CancellationSignal
@@ -27,7 +30,6 @@ import android.os.Parcel
 import android.os.ParcelFileDescriptor
 import android.provider.CloudMediaProviderContract
 import android.test.mock.MockContentProvider
-import com.android.photopicker.core.glide.PhotopickerMediaFetcher
 import kotlin.concurrent.thread
 
 /**
@@ -64,48 +66,43 @@ class MockContentProviderWrapper(val provider: ContentProvider) : MockContentPro
         return provider.openTypedAssetFile(uri, mimeType, opts)
     }
 
-    /**
-     * Pass calls to the wrapped provider. DiamaneOS: the picker's image call is answered as
-     * MediaProvider answers it, with the wrapped provider's own file: MediaProvider opens the item
-     * with these options and writes a PNG of the pixels its decode service checked into the pipe.
-     * Here the test image goes into the pipe as it is.
-     */
+    /** Tests only: hand the fixture's pixels through the production typed-result protocol. */
     override fun call(authority: String, method: String, arg: String?, extras: Bundle?): Bundle? {
-        if (method != PhotopickerMediaFetcher.PICKER_IMAGE_CALL || arg == null || extras == null) {
+        if (method != PickerImageClient.METHOD || arg == null || extras == null) {
             return provider.call(authority, method, arg, extras)
         }
-        // A copy, as binder makes one: the picker closes its own end as soon as the call returns.
         val parcel = Parcel.obtain()
-        val received =
-            try {
-                extras.writeToParcel(parcel, 0)
-                parcel.setDataPosition(0)
-                Bundle.CREATOR.createFromParcel(parcel)
-            } finally {
-                parcel.recycle()
-            }
+        val received = try {
+            extras.writeToParcel(parcel, 0)
+            parcel.setDataPosition(0)
+            Bundle.CREATOR.createFromParcel(parcel)
+        } finally { parcel.recycle() }
         @Suppress("DEPRECATION")
-        val out =
-            received.getParcelable<ParcelFileDescriptor>(
-                PhotopickerMediaFetcher.EXTRA_PICKER_IMAGE_OUT
-            ) ?: return provider.call(authority, method, arg, extras)
-        val opts =
-            Bundle().apply {
-                @Suppress("DEPRECATION")
-                extras.getParcelable<Point>(ContentResolver.EXTRA_SIZE)?.let {
-                    putParcelable(ContentResolver.EXTRA_SIZE, it)
-                }
-                putBoolean(CloudMediaProviderContract.EXTRA_PREVIEW_THUMBNAIL, true)
-                if (extras.getBoolean(CloudMediaProviderContract.EXTRA_MEDIASTORE_THUMB)) {
-                    putBoolean(CloudMediaProviderContract.EXTRA_MEDIASTORE_THUMB, true)
-                }
+        val out = received.getParcelable<ParcelFileDescriptor>(PickerImageClient.OUT) ?: error("No liveness fd")
+        @Suppress("DEPRECATION")
+        val receiver = received.getParcelable<ResultReceiver>(PickerImageClient.RECEIVER) ?: error("No receiver")
+        val opts = Bundle().apply {
+            @Suppress("DEPRECATION")
+            extras.getParcelable<Point>(ContentResolver.EXTRA_SIZE)?.let { putParcelable(ContentResolver.EXTRA_SIZE, it) }
+            putBoolean(CloudMediaProviderContract.EXTRA_PREVIEW_THUMBNAIL, true)
+            if (extras.getBoolean(CloudMediaProviderContract.EXTRA_MEDIASTORE_THUMB)) {
+                putBoolean(CloudMediaProviderContract.EXTRA_MEDIASTORE_THUMB, true)
             }
-        val mime =
-            extras.getString(PhotopickerMediaFetcher.EXTRA_PICKER_IMAGE_MIME) ?: "image/*"
+        }
+        val mime = extras.getString(PickerImageClient.MIME) ?: "image/*"
         val afd = provider.openTypedAssetFile(Uri.parse(arg), mime, opts, CancellationSignal())
         thread {
-            ParcelFileDescriptor.AutoCloseOutputStream(out).use { sink ->
-                afd?.createInputStream()?.use { it.copyTo(sink) }
+            out.use {
+                afd.use { source ->
+                    val bitmap = source?.createInputStream()?.use { BitmapFactory.decodeStream(it) }
+                    if (bitmap == null) {
+                        receiver.send(PickerImageClient.REJECTED, Bundle())
+                    } else {
+                        val shared = bitmap.asShared()
+                        try { receiver.send(PickerImageClient.OK, Bundle().apply { putParcelable(PickerImageClient.BITMAP, shared) }) }
+                        finally { if (shared !== bitmap) shared.recycle(); bitmap.recycle() }
+                    }
+                }
             }
         }
         return Bundle()

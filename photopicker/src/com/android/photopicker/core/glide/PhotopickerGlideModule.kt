@@ -21,7 +21,9 @@ import android.content.Context
 import android.graphics.drawable.Drawable
 import android.util.Log
 import com.android.photopicker.core.ApplicationOwned
-import com.android.providers.media.vmdecode.frames.VmFrames
+import com.android.providers.media.vmdecode.frames.PickerImage
+import com.bumptech.glide.request.RequestOptions
+import com.bumptech.glide.load.engine.DiskCacheStrategy
 import com.bumptech.glide.Glide
 import com.bumptech.glide.GlideBuilder
 import com.bumptech.glide.Registry
@@ -31,7 +33,6 @@ import dagger.hilt.EntryPoint
 import dagger.hilt.EntryPoints
 import dagger.hilt.InstallIn
 import dagger.hilt.components.SingletonComponent
-import java.io.InputStream
 
 /**
  * The Photopicker's Glide configuration entrypoint.
@@ -55,7 +56,7 @@ class PhotopickerGlideModule : AppGlideModule() {
 
         registry.append(
             GlideLoadable::class.java,
-            InputStream::class.java,
+            PickerImage::class.java,
             PhotopickerModelLoaderFactory(resolver),
         )
         registry.append(
@@ -63,12 +64,14 @@ class PhotopickerGlideModule : AppGlideModule() {
             Drawable::class.java,
             PhotopickerDrawableLoaderFactory(context),
         )
-        // DiamaneOS: an animation MediaProvider made in the decode service's VM (VmFrames), before any decoder that
-        // would read image bytes. It never decodes an image file.
-        registry.prepend(InputStream::class.java, Drawable::class.java, VmFrames.Decoder(context.resources))
+        // DiamaneOS: retain the checked bitmap, colour space and gain map through display.
+        registry.prepend(PickerImage::class.java, android.graphics.Bitmap::class.java, PickerImage.BitmapDecoder())
+        registry.prepend(PickerImage::class.java, Drawable::class.java, PickerImage.DrawableDecoder(context.resources))
     }
 
     override fun applyOptions(context: Context, builder: GlideBuilder) {
+        // DiamaneOS: avoid encoded caches that omit part of the checked pixel resource.
+        builder.setDefaultRequestOptions(RequestOptions().diskCacheStrategy(DiskCacheStrategy.NONE))
         if (Log.isLoggable(TAG, Log.VERBOSE)) {
             builder.setLogLevel(Log.VERBOSE)
         }

@@ -20,6 +20,7 @@ import android.content.ContentProvider
 import android.content.ContentResolver
 import android.content.Context
 import android.content.pm.ApplicationInfo
+import android.content.pm.PackageManager
 import android.content.res.Resources
 import android.graphics.Point
 import android.graphics.drawable.Drawable
@@ -75,6 +76,7 @@ import org.junit.Test
 import org.mockito.ArgumentCaptor
 import org.mockito.ArgumentMatchers.any
 import org.mockito.ArgumentMatchers.anyInt
+import org.mockito.ArgumentMatchers.anyString
 import org.mockito.Captor
 import org.mockito.Mock
 import org.mockito.Mockito.never
@@ -132,6 +134,8 @@ class LoadMediaTest {
 
     @Mock lateinit var mockContentProvider: ContentProvider
     @Mock lateinit var mockResources: Resources
+    @Mock lateinit var mockPackageManager: PackageManager
+    @Mock lateinit var mockPackageContext: Context
     @Mock lateinit var mockCallback: DataFetcher.DataCallback<in Drawable>
     @Captor lateinit var uri: ArgumentCaptor<Uri>
     @Captor lateinit var mimeType: ArgumentCaptor<String>
@@ -328,9 +332,13 @@ class LoadMediaTest {
         }
 
         val icon = context.getDrawable(R.drawable.android)
-        whenever(mockContext.getResources()).thenReturn(mockResources)
-        whenever(mockResources.getDrawable(anyInt(), any())).thenReturn(icon)
-        // An icon of a package on the system image.
+        whenever(mockContext.createPackageContextAsUser(anyString(), anyInt(), any()))
+            .thenReturn(mockPackageContext)
+        whenever(mockContext.getPackageManager()).thenReturn(mockPackageManager)
+        whenever(mockPackageContext.getPackageManager()).thenReturn(mockPackageManager)
+        whenever(mockPackageContext.getApplicationInfo()).thenReturn(ApplicationInfo())
+        whenever(mockPackageManager.getDrawable(anyString(), anyInt(), any())).thenReturn(icon)
+        whenever(mockPackageManager.getUserBadgedIcon(any(), any())).thenReturn(icon)
         whenever(mockContext.getApplicationInfo())
             .thenReturn(ApplicationInfo().apply { flags = ApplicationInfo.FLAG_SYSTEM })
 
@@ -344,7 +352,7 @@ class LoadMediaTest {
                 capture(userHandle),
             )
 
-        verify(mockResources).getDrawable(capture(resourceId), any())
+        verify(mockPackageManager).getDrawable(anyString(), capture(resourceId), any())
 
         assertThat(packageName.value).isEqualTo(drawableLoadable.getLoadableUri().host)
         assertThat(userHandle.value).isEqualTo(UserHandle.of(context.userId))
@@ -352,11 +360,10 @@ class LoadMediaTest {
     }
 
     /**
-     * DiamaneOS: an icon of a package that is not on the system image (a cloud media provider's) is
-     * not loaded, so its image file is never decoded in the picker's process.
+     * DiamaneOS: a host outside the system image has no guaranteed clean-copy gate.
      */
     @Test
-    fun testDrawableFetcherRefusesIconOutsideSystemImage() {
+    fun testDrawableFetcherRefusesUngatedHost() {
         whenever(
             mockContext.createPackageContextAsUser(
                 any(String::class.java),
