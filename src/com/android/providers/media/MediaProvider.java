@@ -2188,17 +2188,9 @@ public class MediaProvider extends ContentProvider {
 
     @VisibleForTesting
     void detectSpecialFormat(@NonNull CancellationSignal signal) {
-        // Picker sync and special format update can execute concurrently and run into a deadlock.
-        // Acquiring a lock before execution of each flow to avoid this.
-        PickerSyncController.sIdleMaintenanceSyncLock.lock();
-        try {
-            mExternalDatabase.runWithTransaction((db) -> {
-                updateSpecialFormatColumn(db, signal);
-                return null;
-            });
-        } finally {
-            PickerSyncController.sIdleMaintenanceSyncLock.unlock();
-        }
+        // DiamaneOS: source reads run between a snapshot and short generation-checked writes.
+        com.android.providers.media.vmdecode.VmMetadataRepair.run(
+                getContext(), mExternalDatabase, mPickerDbFacade, signal);
     }
 
     private void fixUnsupportedMimeTypesForAndroid15(Context context) {

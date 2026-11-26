@@ -135,6 +135,49 @@ public class ModernMediaScannerTest {
     }
 
     @Test
+    public void parserPressureDefersNormalScanAndRetriesAllMetadata() throws Exception {
+        final File file = new File(mDir, "parser-pressure.mp3");
+        stage(R.raw.test_audio, file);
+        final Class<?> reader = Class.forName("com.android.providers.media.vmdecode.SourceReader");
+        final java.lang.reflect.Field field = reader.getDeclaredField("sBudget");
+        field.setAccessible(true);
+        final Object budget = field.get(null);
+        final java.lang.reflect.Method reserve = budget.getClass().getDeclaredMethod(
+                "reserve", String.class, long.class);
+        reserve.setAccessible(true);
+        final java.util.List<AutoCloseable> tickets = new java.util.ArrayList<>();
+        try {
+            for (int i = 0; i < 3; i++) {
+                final AutoCloseable ticket = (AutoCloseable) reserve.invoke(budget,
+                        "pressure-" + i, 40L * 1024 * 1024);
+                assertNotNull(ticket);
+                tickets.add(ticket);
+            }
+            final java.lang.reflect.Method scan = ModernMediaScanner.class.getDeclaredMethod(
+                    "scanItemAudio", long.class, File.class,
+                    java.nio.file.attribute.BasicFileAttributes.class, String.class,
+                    int.class, String.class);
+            scan.setAccessible(true);
+            final java.nio.file.attribute.BasicFileAttributes attrs = java.nio.file.Files.readAttributes(
+                    file.toPath(), java.nio.file.attribute.BasicFileAttributes.class);
+            try {
+                scan.invoke(mModern, -1L, file, attrs, "audio/mpeg", 2, MediaStore.VOLUME_EXTERNAL_PRIMARY);
+                throw new AssertionError("ordinary scan bypassed shared parser admission");
+            } catch (java.lang.reflect.InvocationTargetException failure) {
+                assertTrue(failure.getCause() instanceof
+                        com.android.providers.media.vmdecode.MetadataAdmission.Pressure);
+            }
+        } finally { for (AutoCloseable ticket : tickets) ticket.close(); }
+        final Uri result = mModern.scanFile(file, REASON_DEMAND);
+        assertNotNull(result);
+        try (Cursor cursor = mIsolatedResolver.query(result,
+                new String[] {MediaStore.Audio.AudioColumns.DURATION}, null, null, null)) {
+            assertTrue(cursor.moveToFirst());
+            assertTrue(cursor.getLong(0) > 0);
+        }
+    }
+
+    @Test
     public void testSimple() throws Exception {
         assertNotNull(mModern.getContext());
     }

@@ -1071,7 +1071,7 @@ public class ModernMediaScanner implements MediaScanner {
                 Trace.endSection();
             }
 
-            final ContentProviderOperation.Builder op;
+            ContentProviderOperation.Builder op;
             Trace.beginSection("Scanner.scanItem");
             sScanOwner.set(scanOwner);
             // DiamaneOS: a scan on demand is one an app's binder call waits for (a file it wrote and published).
@@ -1083,6 +1083,12 @@ public class ModernMediaScanner implements MediaScanner {
                     VmDecode.Bound ignored = bounded ? VmDecode.boundWaits(DEMAND_VM_MS, mSignal) : null) {
                 op = scanItem(existingId, realFile, attrs, actualMimeType, actualMediaType,
                         mVolumeName, mRestoreExecutorOptional.orElse(null));
+            } catch (com.android.providers.media.vmdecode.MetadataAdmission.Pressure pressure) {
+                // DiamaneOS: keep the row unchanged and its directory dirty until all checks can run.
+                op = null;
+                mFillIns.add(realFile);
+                final File dirty = FileUtils.getTopLevelNoMedia(realFile.getParentFile());
+                onDirectoryDirty(dirty == null ? realFile.getParentFile() : dirty);
             } finally {
                 sScanOwner.remove();
                 Trace.endSection();
@@ -1591,7 +1597,7 @@ public class ModernMediaScanner implements MediaScanner {
 
     private void withResolutionValues(
             @NonNull ContentProviderOperation.Builder op,
-            @NonNull ExifInterface exif, @NonNull File file) {
+            @NonNull ExifInterface exif, VmDecode.Info header) {
         final Optional<?> width = parseOptionalOrZero(
                 exif.getAttribute(ExifInterface.TAG_IMAGE_WIDTH));
         final Optional<?> height = parseOptionalOrZero(
@@ -1602,24 +1608,20 @@ public class ModernMediaScanner implements MediaScanner {
             withOptionalValue(op, MediaColumns.HEIGHT, height);
             op.withValue(MediaColumns.RESOLUTION, resolution.get());
         } else {
-            withBitmapResolutionValues(op, file);
+            withBitmapResolutionValues(op, header);
         }
     }
 
     private void withBitmapResolutionValues(
             @NonNull ContentProviderOperation.Builder op,
-            @NonNull File file) {
+            VmDecode.Info header) {
         // The header is read in the decode service's VM. When it is unavailable the size stays unset, and idle
         // maintenance fills it in together with the special format.
         int outWidth = 0;
         int outHeight = 0;
-        try {
-            final VmDecode.Info info = VmDecode.probe(file, sScanOwner.get(),
-                    VmDecode.PRIORITY_BACKGROUND);
-            outWidth = info.width;
-            outHeight = info.height;
-        } catch (IOException e) {
-            Log.w(TAG, "No image size for " + file + ": " + e.getMessage());
+        if (header != null) {
+            outWidth = header.width;
+            outHeight = header.height;
         }
 
         final Optional<?> width = parseOptionalOrZero(outWidth);
@@ -1659,7 +1661,10 @@ public class ModernMediaScanner implements MediaScanner {
 
         FileUtils.computeAudioTypeValuesFromData(file.getAbsolutePath(), op::withValue);
 
-        try (FileInputStream is = new FileInputStream(file)) {
+        // DiamaneOS: reserve the shared parser allowance before opening the source.
+        final com.android.providers.media.vmdecode.MetadataAdmission admission =
+                VmDecode.metadataAdmission(sScanOwner.get());
+        try (admission; FileInputStream is = new FileInputStream(file)) {
             try (MediaMetadataRetriever mmr = new MediaMetadataRetriever()) {
                 mmr.setDataSource(is.getFD());
 
@@ -1732,7 +1737,10 @@ public class ModernMediaScanner implements MediaScanner {
         op.withValue(VideoColumns.COLOR_RANGE, null);
         op.withValue(FileColumns._VIDEO_CODEC_TYPE, null);
 
-        try (FileInputStream is = new FileInputStream(file)) {
+        // DiamaneOS: reserve the shared parser allowance before opening the source.
+        final com.android.providers.media.vmdecode.MetadataAdmission admission =
+                VmDecode.metadataAdmission(sScanOwner.get());
+        try (admission; FileInputStream is = new FileInputStream(file)) {
             try (MediaMetadataRetriever mmr = new MediaMetadataRetriever()) {
                 mmr.setDataSource(is.getFD());
 
@@ -1814,10 +1822,17 @@ public class ModernMediaScanner implements MediaScanner {
 
         op.withValue(ImageColumns.DESCRIPTION, null);
 
-        try (FileInputStream is = new FileInputStream(file)) {
+        // DiamaneOS: the VM header finishes before parser admission is taken.
+        VmDecode.Info header = null;
+        try { header = VmDecode.probe(file, sScanOwner.get(), VmDecode.PRIORITY_BACKGROUND); }
+        catch (IOException ignored) { }
+        // DiamaneOS: reserve the shared parser allowance before opening the source.
+        final com.android.providers.media.vmdecode.MetadataAdmission admission =
+                VmDecode.metadataAdmission(sScanOwner.get());
+        try (admission; FileInputStream is = new FileInputStream(file)) {
             final ExifInterface exif = new ExifInterface(is);
 
-            withResolutionValues(op, exif, file);
+            withResolutionValues(op, exif, header);
 
             withOptionalValue(op, MediaColumns.DATE_TAKEN,
                     parseOptionalDateTaken(exif, lastModifiedTime(file, attrs) * 1000));
@@ -1848,7 +1863,7 @@ public class ModernMediaScanner implements MediaScanner {
 
             try {
                 op.withValue(FileColumns._SPECIAL_FORMAT,
-                        SpecialFormatDetector.detect(exif, file, sScanOwner.get()));
+                        SpecialFormatDetector.detect(exif, header));
             } catch (VmDecodeUnavailableException | VmDecodeRejectedException e) {
                 // Only real answers are stored. NULL makes idle maintenance try again, also once the VM
                 // reads a format it cannot read today.
