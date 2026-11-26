@@ -992,10 +992,14 @@ public class ModernMediaScanner implements MediaScanner {
             queryArgs.putInt(MediaStore.QUERY_ARG_MATCH_FAVORITE, MediaStore.MATCH_INCLUDE);
             final String[] projection = new String[] {FileColumns._ID, FileColumns.DATE_MODIFIED,
                     FileColumns.SIZE, FileColumns.MIME_TYPE, FileColumns.MEDIA_TYPE,
-                    FileColumns.IS_PENDING, FileColumns._MODIFIER, FileColumns.OWNER_PACKAGE_NAME};
+                    FileColumns.IS_PENDING, FileColumns._MODIFIER, FileColumns.OWNER_PACKAGE_NAME,
+                    FileColumns._USER_ID};
             // The app that supplied the bytes, for the decode service's fair queue: the row's owner, or the
             // package an Android/media path belongs to.
             String scanOwner = FileUtils.extractPathOwnerPackageName(realFile.getAbsolutePath());
+            // DiamaneOS: the volume or canonical storage path supplies a new file's user.
+            int scanUser = FileUtils.extractUserId(realFile.getAbsolutePath());
+            if (scanUser < 0 && mVolume.getUser() != null) scanUser = mVolume.getUser().getIdentifier();
 
             final Matcher matcher = FileUtils.PATTERN_EXPIRES_FILE.matcher(realFile.getName());
             // If IS_PENDING is set by FUSE, we should scan the file and update IS_PENDING to zero.
@@ -1009,6 +1013,7 @@ public class ModernMediaScanner implements MediaScanner {
                     if (!c.isNull(7)) {
                         scanOwner = c.getString(7);
                     }
+                    if (!c.isNull(8)) scanUser = c.getInt(8);
                     final String mimeType = c.getString(3);
                     final int mediaType = c.getInt(4);
                     isPendingFromFuse &= c.getInt(5) != 0;
@@ -1074,7 +1079,8 @@ public class ModernMediaScanner implements MediaScanner {
             // VM cannot answer in that time is left out and the file is scanned again later (VmFillIns).
             final boolean bounded = mReason == REASON_DEMAND && !VmFillIns.isFillInThread();
             final int unavailable = VmDecode.unavailableCount();
-            try (VmDecode.Bound ignored = bounded ? VmDecode.boundWaits(DEMAND_VM_MS, mSignal) : null) {
+            try (VmDecode.UserScope user = VmDecode.forUser(scanUser);
+                    VmDecode.Bound ignored = bounded ? VmDecode.boundWaits(DEMAND_VM_MS, mSignal) : null) {
                 op = scanItem(existingId, realFile, attrs, actualMimeType, actualMediaType,
                         mVolumeName, mRestoreExecutorOptional.orElse(null));
             } finally {

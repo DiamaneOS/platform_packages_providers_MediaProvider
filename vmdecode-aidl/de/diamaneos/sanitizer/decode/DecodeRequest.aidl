@@ -24,7 +24,8 @@ parcelable DecodeRequest {
      * The bytes, opened read-only by the caller. A regular file, a memory file or a pipe, possibly from another app.
      * The service reads it under its own deadline (a pipe that stalls or never ends cannot hold anyone up), at most
      * IDecodeService.MAX_BUFFERED_BYTES into memory (MAX_PROBE_BYTES for a probe), and hands the bytes to the VM
-     * unopened. A larger regular file not on FUSE, up to MAX_INPUT_BYTES, is streamed to the VM instead. It never
+     * unopened. A larger sealed memory file or regular file on a bounded local filesystem, up to MAX_INPUT_BYTES,
+     * is transported from its descriptor instead. It never
      * parses them itself.
      */
     ParcelFileDescriptor file;
@@ -40,4 +41,47 @@ parcelable DecodeRequest {
 
     /** The caller's MIME type for the file. A hint for logs only: the VM detects the format from the bytes. */
     String mimeTypeHint;
+
+    /**
+     * The Android user whose image this is: answers are kept per user. The system server and SystemUI set it to the
+     * user of the app they ask for, from that app's uid: without it they are refused. Any other caller may leave it
+     * IDecodeService.NO_USER (its own user is taken) or name its own user. A launcher may also name a profile of its
+     * user (a work profile's widget).
+     */
+    int ownerUser = -10000;
+
+    /**
+     * Only from the system server: the uid of the app it decodes for (its decode gate for that app, a thumbnail that
+     * process loads), or -1 for a decode of its own. The service decides from it, as from every caller's own uid,
+     * whether the image is per-user content (decoded in a per-user process on Android: the VM holds per-user content
+     * of one user at a time) or shared (decoded for every user in one process on Android: SystemUI's, the system
+     * server's own). Ignored from any other caller.
+     */
+    int forUid = -1;
+
+    /** Requested checked raw pixel storage for thumbnail and region operations. */
+    int pixelFormat = 0;
+
+    /**
+     * Decode only the checked Ultra HDR gain pixels: in decodeThumbnail the gain image at the scale of the requested
+     * stored-base size, in decodeRegion a region of the gain image in its own stored pixels, clipped to it.
+     */
+    boolean gainmapOnly = false;
+
+    /** Internal RGBA JPEG gain metadata preview, at most 64 x 64. Ordinary thumbnails keep streaming. */
+    boolean gainmapPreview = false;
+
+    /**
+     * decodeFrames: a window of frameWindow frames from firstFrame on (Frames.firstFrame, Frames.totalFrames), as
+     * many as DecodeChecks.framesWindowCount gives. frameWindow 0 asks every frame, firstFrame is then 0.
+     */
+    int firstFrame = 0;
+    int frameWindow = 0;
+
+    /**
+     * decodeFrames with frameWindow 1: the top row + 1 of a band of that frame (0: the whole frame). The frame is
+     * then exactly min(box, canvas) per side, the band its rows from the top on, as many as DecodeChecks.framesBandRows
+     * gives (Frames.frameHeight the whole frame's height).
+     */
+    int frameBand = 0;
 }

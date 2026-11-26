@@ -65,7 +65,7 @@ class MockContentProviderWrapper(val provider: ContentProvider) : MockContentPro
     }
 
     /**
-     * Pass calls to the wrapped provider. The picker's image call (DiamaneOS) is answered as
+     * Pass calls to the wrapped provider. DiamaneOS: the picker's image call is answered as
      * MediaProvider answers it, with the wrapped provider's own file: MediaProvider opens the item
      * with these options and writes a PNG of the pixels its decode service checked into the pipe.
      * Here the test image goes into the pipe as it is.

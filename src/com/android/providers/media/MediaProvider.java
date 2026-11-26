@@ -9840,10 +9840,9 @@ public class MediaProvider extends ContentProvider {
         }
 
         private File getThumbnailFile(Uri uri) throws IOException {
-            // Always save generated thumbnails to primary storage
-            final File volumePath = getVolumePath(MediaStore.VOLUME_EXTERNAL_PRIMARY);
-            return FileUtils.buildPath(volumePath, directoryName,
-                    DIRECTORY_THUMBNAILS, ContentUris.parseId(uri) + ".jpg");
+            // DiamaneOS: versioned thumbnail storage follows the authenticated row user.
+            return com.android.providers.media.vmdecode.VmMediaRows.cacheFile(
+                    MediaProvider.this::queryForSingleItemAsMediaProvider, uri, mUserCache, directoryName);
         }
 
         public abstract Bitmap getThumbnailBitmap(Uri uri, CancellationSignal signal)
@@ -9995,34 +9994,38 @@ public class MediaProvider extends ContentProvider {
     private final Thumbnailer mAudioThumbnailer = new Thumbnailer(Environment.DIRECTORY_MUSIC) {
         @Override
         public Bitmap getThumbnailBitmap(Uri uri, CancellationSignal signal) throws IOException {
-            return VmDecode.audioThumbnail(queryForDataFile(uri, signal), mThumbSize,
-                    queryForOwnerPackage(uri, signal), signal);
+            // DiamaneOS: keep the file, supplying package and source user in one row snapshot.
+            return com.android.providers.media.vmdecode.VmMediaRows.thumbnail(
+                    MediaProvider.this::queryForSingleItemAsMediaProvider, uri, mThumbSize, signal,
+                    com.android.providers.media.vmdecode.VmMediaRows.AUDIO);
         }
     };
 
     private final Thumbnailer mVideoThumbnailer = new Thumbnailer(Environment.DIRECTORY_MOVIES) {
         @Override
         public Bitmap getThumbnailBitmap(Uri uri, CancellationSignal signal) throws IOException {
-            return VmDecode.videoThumbnail(queryForDataFile(uri, signal), mThumbSize,
-                    queryForOwnerPackage(uri, signal), signal);
+            // DiamaneOS: keep the file, supplying package and source user in one row snapshot.
+            return com.android.providers.media.vmdecode.VmMediaRows.thumbnail(
+                    MediaProvider.this::queryForSingleItemAsMediaProvider, uri, mThumbSize, signal,
+                    com.android.providers.media.vmdecode.VmMediaRows.VIDEO);
         }
     };
 
     private final Thumbnailer mImageThumbnailer = new Thumbnailer(Environment.DIRECTORY_PICTURES) {
         @Override
         public Bitmap getThumbnailBitmap(Uri uri, CancellationSignal signal) throws IOException {
-            return VmDecode.imageThumbnail(queryForDataFile(uri, signal), mThumbSize,
-                    queryForOwnerPackage(uri, signal), signal);
+            // DiamaneOS: keep the file, supplying package and source user in one row snapshot.
+            return com.android.providers.media.vmdecode.VmMediaRows.thumbnail(
+                    MediaProvider.this::queryForSingleItemAsMediaProvider, uri, mThumbSize, signal,
+                    com.android.providers.media.vmdecode.VmMediaRows.IMAGE);
         }
     };
 
     private List<File> getThumbnailDirectories(MediaVolume volume) throws FileNotFoundException {
         final File volumePath = volume.getPath();
-        return Arrays.asList(
-                FileUtils.buildPath(volumePath, Environment.DIRECTORY_MUSIC, DIRECTORY_THUMBNAILS),
-                FileUtils.buildPath(volumePath, Environment.DIRECTORY_MOVIES, DIRECTORY_THUMBNAILS),
-                FileUtils.buildPath(volumePath, Environment.DIRECTORY_PICTURES,
-                        DIRECTORY_THUMBNAILS));
+        // DiamaneOS: enumerate only versioned cache directories for the served users.
+        return com.android.providers.media.vmdecode.VmMediaRows.cacheDirectories(
+                volumePath, mUserCache.getUsersCached());
     }
 
     private void invalidateThumbnails(Uri uri) {

@@ -124,16 +124,19 @@ public final class VmDecode {
     public static final class Bound implements AutoCloseable {
         private final long mPrevious;
         private final CancellationSignal mPreviousSignal;
+        private final Runnable mPreviousCheck;
 
-        Bound(long previous, CancellationSignal previousSignal) {
+        Bound(long previous, CancellationSignal previousSignal, Runnable previousCheck) {
             mPrevious = previous;
             mPreviousSignal = previousSignal;
+            mPreviousCheck = previousCheck;
         }
 
         @Override
         public void close() {
             sBound.get()[0] = mPrevious;
             sBoundSignal.set(mPreviousSignal);
+            sBoundCheck.set(mPreviousCheck);
         }
     }
 
@@ -148,19 +151,31 @@ public final class VmDecode {
     }
 
     private static final ThreadLocal<CancellationSignal> sBoundSignal = new ThreadLocal<>();
+    private static final ThreadLocal<Runnable> sBoundCheck = new ThreadLocal<>();
+
+    static void checkBoundCancellation() {
+        if (sBoundSignal.get() != null) sBoundSignal.get().throwIfCanceled();
+        if (sBoundCheck.get() != null) sBoundCheck.get().run();
+    }
 
     static CancellationSignal boundSignal() {
         return sBoundSignal.get();
     }
 
     public static Bound boundWaits(long timeoutMs, CancellationSignal signal) {
+        return boundWaits(timeoutMs, signal, null);
+    }
+
+    public static Bound boundWaits(long timeoutMs, CancellationSignal signal, Runnable checkpoint) {
+        final Runnable previousCheck = sBoundCheck.get();
+        sBoundCheck.set(checkpoint == null ? previousCheck : checkpoint);
         final CancellationSignal previousSignal = sBoundSignal.get();
         sBoundSignal.set(signal == null ? previousSignal : signal);
         final long[] bound = sBound.get();
         final long previous = bound[0];
         final long end = SystemClock.uptimeMillis() + Math.max(1, timeoutMs);
         bound[0] = previous == 0 ? end : Math.min(previous, end);
-        return new Bound(previous, previousSignal);
+        return new Bound(previous, previousSignal, previousCheck);
     }
 
     static long boundEnd() {
@@ -250,11 +265,68 @@ public final class VmDecode {
         }
     }
 
-    /** True once {@link #init} ran in this process. */
-    public static boolean isInitialized() {
+    /**
+     * Thumbnails of this user follow soon: Files or the photo picker opened a view of media. The decode service may
+     * start its VM for this user now, before the first thumbnail. A hint: it never waits and never fails.
+     */
+    public static void prepare() {
+        final DecodeClient client;
         synchronized (sLock) {
-            return sClient != null;
+            client = sClient;
         }
+        if (client != null) {
+            final Integer user = sSourceUser.get();
+            if (user != null && user >= 0) client.prepare(user);
+        }
+    }
+
+    public static void prepareForUser(int user) {
+        final DecodeClient client;
+        synchronized (sLock) { client = sClient; }
+        if (client != null && user >= 0) client.prepare(user);
+    }
+
+    private static final ThreadLocal<Integer> sSourceUser = new ThreadLocal<>();
+
+    public static final class UserScope implements AutoCloseable {
+        private final Integer mPrevious;
+        UserScope(Integer previous) { mPrevious = previous; }
+        public void close() {
+            if (mPrevious == null) sSourceUser.remove();
+            else sSourceUser.set(mPrevious);
+        }
+    }
+
+    /** The authenticated source row or selected profile supplies this user. */
+    public static UserScope forUser(int user) {
+        final Integer previous = sSourceUser.get();
+        sSourceUser.set(user);
+        return new UserScope(previous);
+    }
+
+    private static int sourceUser() {
+        final Integer user = sSourceUser.get();
+        return user == null ? android.os.UserHandle.myUserId() : user;
+    }
+
+    private static String principal(String packageName) {
+        return sourceUser() + ":" + (packageName == null ? "" : packageName);
+    }
+
+    public interface MetadataWork<T> { T run() throws IOException; }
+
+    /** Metadata and source preparation share admission, cancellation and the remaining row deadline. */
+    public static <T> T metadataWork(String packageName, long timeout, CancellationSignal signal,
+            MetadataWork<T> work) throws IOException {
+        final int user = sourceUser();
+        final long end = Math.min(SystemClock.uptimeMillis() + timeout,
+                boundEnd() == 0 ? Long.MAX_VALUE : boundEnd());
+        return SourceReader.metadata(principal(packageName), timeout, () -> {
+            try (Bound bound = boundWaits(Math.max(1, end - SystemClock.uptimeMillis()), signal);
+                    UserScope scope = forUser(user)) {
+                return work.run();
+            }
+        });
     }
 
     /** What the VM found in an image header. */
@@ -287,8 +359,8 @@ public final class VmDecode {
      */
     public static @NonNull Info probe(@NonNull File file, @Nullable String owner, int priority)
             throws IOException {
-        try (SourceReader.Prepared prepared = SourceReader.prepare(file, owner, true)) {
-            final String key = prepared.identity;
+        try (SourceReader.Prepared prepared = SourceReader.prepare(file, principal(owner), true)) {
+            final String key = sourceUser() + ":" + prepared.identity;
             final Info cached = sProbeCache.get(key);
             if (cached != null) return cached;
             final Rejected rejected = sRejectedCache.get(key);
@@ -300,7 +372,7 @@ public final class VmDecode {
             }
             try {
                 final DecodeRequest request = request(prepared.file, owner, priority, mimeOf(file));
-                final Info info = client().call(priority, owner, service -> {
+                final Info info = client().call(priority, principal(owner), service -> {
                     final ImageInfo reply = service.probe(request);
                     checkReply(reply == null, DecodeChecks.check(reply));
                     checkStatus(reply.status);
@@ -321,7 +393,7 @@ public final class VmDecode {
     /** A thumbnail of an image file that fits in {@code size}, turned upright. */
     public static @NonNull Bitmap imageThumbnail(@NonNull File file, @NonNull Size size, @Nullable String owner,
             @Nullable CancellationSignal signal) throws IOException {
-        try (SourceReader.Prepared prepared = SourceReader.prepare(file, owner, false)) {
+        try (SourceReader.Prepared prepared = SourceReader.prepare(file, principal(owner), false)) {
             return decode(prepared.file, owner, PRIORITY_USER_WAITING, mimeOf(file),
                     size.getWidth(), size.getHeight(), signal);
         }
@@ -344,43 +416,7 @@ public final class VmDecode {
         } catch (RuntimeException e) {
             throw new IOException("Failed to create thumbnail", e);
         }
-        if (picture != null) {
-            return decodeBytes(picture, owner, size, signal);
-        }
-
-        // The same search as ThumbnailUtils: only on external storage, not in Download or a top-level folder.
-        if (Environment.MEDIA_UNKNOWN.equals(Environment.getExternalStorageState(file))) {
-            throw new IOException("No embedded album art found");
-        }
-        final File parent = file.getParentFile();
-        final File grandParent = parent != null ? parent.getParentFile() : null;
-        if (parent != null && parent.getName().equals(Environment.DIRECTORY_DOWNLOADS)) {
-            throw new IOException("No thumbnails in Downloads directories");
-        }
-        if (grandParent != null
-                && Environment.MEDIA_UNKNOWN.equals(Environment.getExternalStorageState(grandParent))) {
-            throw new IOException("No thumbnails in top-level directories");
-        }
-        final File[] found = parent == null ? null : parent.listFiles((dir, name) -> {
-            final String lower = name.toLowerCase(Locale.ROOT);
-            return lower.endsWith(".jpg") || lower.endsWith(".png");
-        });
-        if (found == null || found.length == 0) {
-            throw new IOException("No album art found");
-        }
-        final ToIntFunction<File> score = (f) -> {
-            final String lower = f.getName().toLowerCase(Locale.ROOT);
-            if (lower.equals("albumart.jpg")) return 4;
-            if (lower.startsWith("albumart") && lower.endsWith(".jpg")) return 3;
-            if (lower.contains("albumart") && lower.endsWith(".jpg")) return 2;
-            if (lower.endsWith(".jpg")) return 1;
-            return 0;
-        };
-        final File best = Arrays.stream(found).max(Comparator.comparingInt(score)).orElse(null);
-        if (signal != null) {
-            signal.throwIfCanceled();
-        }
-        return imageThumbnail(Objects.requireNonNull(best), size, owner, signal);
+        return decodeBytes(AudioArtwork.embedded(picture), owner, size, signal);
     }
 
     /**
@@ -416,20 +452,33 @@ public final class VmDecode {
         }
     }
 
+    public static VmMediaRows.Source displaySource(ContentResolver resolver, Uri uri) throws IOException {
+        return SourceReader.displaySource(resolver, uri);
+    }
+
+    public static void cancelWaits(CancellationSignal signal) {
+        SourceReader.cancel(signal);
+    }
+
+    public static Bitmap thumbnailForDisplay(ContentResolver resolver, Uri uri, String packageName,
+            int width, int height) throws IOException {
+        final Bundle options = new Bundle();
+        options.putParcelable(ContentResolver.EXTRA_SIZE, new Point(width, height));
+        try (AssetFileDescriptor asset = SourceReader.openTypedDisplay(resolver, uri, options)) {
+            return decodeAsset(asset, packageName, PRIORITY_USER_WAITING, width, height, boundSignal());
+        }
+    }
+
     /**
      * An image from a content URI for display, fitting in {@code maxWidth} x {@code maxHeight}. For screens that show a
      * full image, such as the permission dialog.
      */
     public static @NonNull Bitmap decodeForDisplay(@NonNull ContentResolver resolver, @NonNull Uri uri,
             @Nullable String owner, int maxWidth, int maxHeight) throws IOException {
-        try (ParcelFileDescriptor opened = resolver.openFileDescriptor(uri, "r")) {
-            if (opened == null) {
-                throw new FileNotFoundException("no file for " + uri);
-            }
-            try (ParcelFileDescriptor pfd = safeSource(opened, owner, false)) {
-                return decode(pfd, owner, PRIORITY_USER_WAITING, resolver.getType(uri), maxWidth, maxHeight,
-                        null);
-            }
+        try (ParcelFileDescriptor opened = SourceReader.openDisplay(resolver, uri, principal(owner));
+                AssetFileDescriptor asset = new AssetFileDescriptor(opened, 0, AssetFileDescriptor.UNKNOWN_LENGTH)) {
+            return withAsset(asset, owner, pfd -> decode(pfd, owner, PRIORITY_USER_WAITING,
+                    null, maxWidth, maxHeight, boundSignal()));
         }
     }
 
@@ -588,8 +637,7 @@ public final class VmDecode {
         }
         final boolean provider = PickerSyncController.LOCAL_PICKER_PROVIDER_AUTHORITY.equals(host)
                 || (cloud != null && cloud.equals(host));
-        final boolean sameUser = user == null
-                || user.equals(String.valueOf(android.os.UserHandle.myUserId()));
+        final boolean sameUser = VmMediaUsers.serves(context, VmMediaRows.uriUser(context, uri));
         if (!ContentResolver.SCHEME_CONTENT.equals(uri.getScheme()) || !provider || !sameUser
                 || path.size() != 2 || !"media".equals(path.get(0)) || uri.getQuery() != null
                 || uri.getFragment() != null
@@ -786,7 +834,7 @@ public final class VmDecode {
             @Nullable String mimeType, int maxWidth, int maxHeight, @Nullable CancellationSignal signal)
             throws IOException {
         final DecodeRequest request = request(pfd, owner, priority, mimeType);
-        return client().call(priority, owner, service -> {
+        return client().call(priority, principal(owner), service -> {
             final Thumbnail reply = service.decodeThumbnail(request, maxWidth, maxHeight);
             checkReply(reply == null, DecodeChecks.check(reply, maxWidth, maxHeight));
             checkStatus(reply.status);
@@ -860,7 +908,7 @@ public final class VmDecode {
     private static Animation decodeFrames(ParcelFileDescriptor pfd, @Nullable String owner, int priority,
             int maxWidth, int maxHeight, @Nullable CancellationSignal signal) throws IOException {
         final DecodeRequest request = request(pfd, owner, priority, null);
-        return client().call(priority, owner, service -> {
+        return client().call(priority, principal(owner), service -> {
             final Frames reply = service.decodeFrames(request, maxWidth, maxHeight);
             checkReply(reply == null, DecodeChecks.check(reply, maxWidth, maxHeight));
             checkStatus(reply.status);
@@ -947,10 +995,15 @@ public final class VmDecode {
     }
 
     private static DecodeRequest request(ParcelFileDescriptor pfd, @Nullable String owner, int priority,
-            @Nullable String mimeType) {
+            @Nullable String mimeType) throws VmDecodeUnavailableException {
+        if (sourceUser() < 0) {
+            countUnavailable();
+            throw new VmDecodeUnavailableException("Image source user is not established");
+        }
         final DecodeRequest request = new DecodeRequest();
         request.file = pfd;
         request.ownerPackage = owner == null ? "" : owner;
+        request.ownerUser = sourceUser();
         request.priority = priority;
         request.mimeTypeHint = mimeType == null ? "" : mimeType;
         return request;

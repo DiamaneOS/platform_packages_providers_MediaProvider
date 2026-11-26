@@ -8,7 +8,7 @@
 
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
-    <!-- Images are decoded in the protected VM of the decode service (de.diamaneos.sanitizer). -->
+    <!-- DiamaneOS: images are decoded in the protected VM of the decode service (de.diamaneos.sanitizer). -->
     <uses-permission android:name="de.diamaneos.sanitizer.permission.DECODE" />
 
     <uses-permission android:name="android.permission.WRITE_SETTINGS" />

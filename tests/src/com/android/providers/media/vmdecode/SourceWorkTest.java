@@ -54,4 +54,18 @@ public class SourceWorkTest {
             pool.shutdown();
         }
     }
+    @Test
+    public void cancelledEntryDoesNotStartSourceWork() throws Exception {
+        final ThreadPoolExecutor pool = new ThreadPoolExecutor(0, 1, 1, TimeUnit.SECONDS,
+                new SynchronousQueue<>());
+        final android.os.CancellationSignal signal = new android.os.CancellationSignal();
+        signal.cancel();
+        try (VmDecode.Bound ignored = VmDecode.boundWaits(1000, signal)) {
+            assertThrows(android.os.OperationCanceledException.class,
+                    () -> SourceWork.call(pool, new SourceBudget(), "app", 1, 1000,
+                            () -> { throw new AssertionError("cancelled source opened"); }, value -> {}));
+        } finally {
+            pool.shutdown();
+        }
+    }
 }

@@ -73,8 +73,8 @@ public class PickerThumbnailFetcher implements DataFetcher<InputStream> {
         mCancellationSignal = new CancellationSignal();
     }
 
-    // A tile that could not be made because the decode service did not answer (here, or in MediaProvider's own
-    // thumbnail, which comes back as a FileNotFoundException with the same message) is tried again while it is
+    // DiamaneOS: a tile that could not be made because the decode service did not answer (here, or in MediaProvider's
+    // own thumbnail, which comes back as a FileNotFoundException with the same message) is tried again while it is
     // wanted: at once when the service answers or connects anew, else after a wait that doubles, at most this long.
     private static final long RETRY_FOR_MS = 60_000;
     private static final long FIRST_RETRY_MS = 2_000;
