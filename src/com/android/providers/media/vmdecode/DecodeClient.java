@@ -24,6 +24,7 @@ import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.os.IBinder;
 import android.os.RemoteException;
+import android.os.SystemClock;
 import android.util.Log;
 
 import androidx.annotation.GuardedBy;
@@ -44,6 +45,10 @@ import java.util.concurrent.TimeUnit;
  * deadlines: one for waiting in its queue, which fails it as unavailable and nothing else, and one from the moment it
  * started. Only a call that started and then missed its deadline drops the binding, since only then has the service
  * broken its own deadline. A missing, slow or dead service makes calls fail with {@link VmDecodeUnavailableException}.
+ * A caller that must not wait long (a scan that an app's binder call waits for) bounds every wait of its thread with
+ * {@link VmDecode#boundWaits}: past that bound the call fails as unavailable and the binding stays. When the service
+ * answers again after calls failed, or connects anew, the answer listeners are told ({@link VmDecode#addAnswerListener})
+ * so what was left out can be asked for again.
  * Nothing here ever decodes a file in MediaProvider.
  */
 final class DecodeClient {
@@ -77,33 +82,44 @@ final class DecodeClient {
     private IDecodeService mService;
     @GuardedBy("mLock")
     private boolean mBinding;
+    @GuardedBy("mLock")
+    private long mBindStart;
+    @GuardedBy("mLock")
+    private Connection mConnection;
+    private static final long STALE_BIND_MS = 30_000;
 
-    private final ServiceConnection mConnection = new ServiceConnection() {
+    // A call failed as unavailable and none succeeded since.
+    private volatile boolean mFailed;
+
+    private final class Connection implements ServiceConnection {
         @Override
         public void onServiceConnected(ComponentName name, IBinder binder) {
             synchronized (mLock) {
+                if (mConnection != this || !mBinding) return;
                 mService = IDecodeService.Stub.asInterface(binder);
                 mLock.notifyAll();
             }
+            // A service that (re)started: what was left out may be asked for again.
+            VmDecode.serviceAnswers();
         }
 
         @Override
         public void onServiceDisconnected(ComponentName name) {
             synchronized (mLock) {
-                mService = null;
+                if (mConnection == this) mService = null;
             }
         }
 
         @Override
         public void onBindingDied(ComponentName name) {
-            unbind();
+            unbind(this);
         }
 
         @Override
         public void onNullBinding(ComponentName name) {
-            unbind();
+            unbind(this);
         }
-    };
+    }
 
     DecodeClient(@NonNull Context context) {
         mContext = context.getApplicationContext();
@@ -112,9 +128,38 @@ final class DecodeClient {
     /** Runs {@code call} for the bytes of {@code owner} on the lane and within the deadlines of {@code priority}. */
     <T> T call(int priority, @Nullable String owner, @NonNull Call<T> call)
             throws VmDecodeUnavailableException, VmDecodeRejectedException {
+        try {
+            final T result = callOnce(priority, owner, call);
+            if (mFailed) {
+                mFailed = false;
+                VmDecode.serviceAnswers();
+            }
+            return result;
+        } catch (VmDecodeUnavailableException e) {
+            mFailed = true;
+            VmDecode.countUnavailable();
+            throw e;
+        }
+    }
+
+    // The wait left for this thread's bound (VmDecode.boundWaits), at most {@code wait}.
+    private static long bounded(long wait) throws VmDecodeUnavailableException {
+        final long end = VmDecode.boundEnd();
+        if (end == 0) {
+            return wait;
+        }
+        final long left = end - SystemClock.uptimeMillis();
+        if (left <= 0) {
+            throw new VmDecodeUnavailableException("no time left for the decode service");
+        }
+        return Math.min(wait, left);
+    }
+
+    private <T> T callOnce(int priority, @Nullable String owner, @NonNull Call<T> call)
+            throws VmDecodeUnavailableException, VmDecodeRejectedException {
         final boolean waiting = priority == IDecodeService.PRIORITY_USER_WAITING;
-        final IDecodeService service = connect(waiting ? CONNECT_TIMEOUT_USER_WAITING_MS
-                : CONNECT_TIMEOUT_BACKGROUND_MS);
+        final IDecodeService service = connect(bounded(waiting ? CONNECT_TIMEOUT_USER_WAITING_MS
+                : CONNECT_TIMEOUT_BACKGROUND_MS));
         final Lane lane = waiting ? mUserWaiting : mBackground;
         final String key = owner == null ? "" : owner;
         final Task<T> task = new Task<>(() -> call.run(service));
@@ -123,13 +168,28 @@ final class DecodeClient {
         }
         lane.start();
         try {
-            if (!task.started.await(waiting ? QUEUE_TIMEOUT_USER_WAITING_MS : QUEUE_TIMEOUT_BACKGROUND_MS,
-                    TimeUnit.MILLISECONDS) && lane.queue.remove(key, task)) {
+            final long queueWait = waiting ? QUEUE_TIMEOUT_USER_WAITING_MS : QUEUE_TIMEOUT_BACKGROUND_MS;
+            final long boundedQueueWait;
+            try {
+                boundedQueueWait = bounded(queueWait);
+            } catch (VmDecodeUnavailableException e) {
+                lane.queue.remove(key, task);
+                throw e;
+            }
+            if (!task.started.await(boundedQueueWait, TimeUnit.MILLISECONDS) && lane.queue.remove(key, task)) {
                 // Never started: the service is not at fault, the binding stays.
                 throw new VmDecodeUnavailableException("waited too long in the queue");
             }
-            if (!task.done.await(waiting ? CALL_TIMEOUT_USER_WAITING_MS : CALL_TIMEOUT_BACKGROUND_MS,
-                    TimeUnit.MILLISECONDS)) {
+            final long callWait = waiting ? CALL_TIMEOUT_USER_WAITING_MS : CALL_TIMEOUT_BACKGROUND_MS;
+            final long end = VmDecode.boundEnd();
+            final long boundedCallWait = end == 0 ? callWait
+                    : Math.max(1, Math.min(callWait, end - SystemClock.uptimeMillis()));
+            if (!task.done.await(boundedCallWait, TimeUnit.MILLISECONDS)) {
+                if (boundedCallWait < callWait) {
+                    // Only this caller's bound ran out: the service may still answer in its time, the call runs on
+                    // in its lane and the binding stays.
+                    throw new VmDecodeUnavailableException("no answer within the caller's bound");
+                }
                 // Started and not answered in time: the service broke its own deadline. Drop the binding, the next
                 // call binds again.
                 unbind();
@@ -227,25 +287,36 @@ final class DecodeClient {
                 return mService;
             }
             mService = null;
+            if (mBinding && SystemClock.uptimeMillis() - mBindStart >= STALE_BIND_MS) {
+                unbind(mConnection);
+            }
             if (!mBinding) {
                 final Intent intent = serviceIntent();
                 if (intent == null) {
                     throw new VmDecodeUnavailableException("no decode service in the system image");
                 }
                 try {
-                    mBinding = mContext.bindService(intent, mConnection,
-                            Context.BIND_AUTO_CREATE | Context.BIND_IMPORTANT);
+                    mConnection = new Connection();
+                    mBindStart = SystemClock.uptimeMillis();
+                    mBinding = true;
+                    if (!mContext.bindService(intent, mConnection,
+                            Context.BIND_AUTO_CREATE | Context.BIND_IMPORTANT)) {
+                        unbind(mConnection);
+                    }
                 } catch (SecurityException e) {
+                    unbind(mConnection);
                     throw new VmDecodeUnavailableException("not allowed to bind the decode service", e);
                 }
                 if (!mBinding) {
                     throw new VmDecodeUnavailableException("decode service did not bind");
                 }
             }
-            final long end = System.currentTimeMillis() + timeoutMs;
+            final long end = SystemClock.uptimeMillis() + timeoutMs;
             while (mService == null) {
-                final long left = end - System.currentTimeMillis();
+                if (!mBinding) throw new VmDecodeUnavailableException("decode binding was dropped");
+                final long left = end - SystemClock.uptimeMillis();
                 if (left <= 0) {
+                    if (SystemClock.uptimeMillis() - mBindStart >= STALE_BIND_MS) unbind(mConnection);
                     throw new VmDecodeUnavailableException("decode service did not connect in time");
                 }
                 try {
@@ -277,6 +348,13 @@ final class DecodeClient {
 
     private void unbind() {
         synchronized (mLock) {
+            unbind(mConnection);
+        }
+    }
+
+    private void unbind(Connection expected) {
+        synchronized (mLock) {
+            if (mConnection != expected) return;
             if (mBinding) {
                 try {
                     mContext.unbindService(mConnection);
@@ -285,7 +363,9 @@ final class DecodeClient {
                 }
             }
             mBinding = false;
+            mConnection = null;
             mService = null;
+            mLock.notifyAll();
         }
     }
 }

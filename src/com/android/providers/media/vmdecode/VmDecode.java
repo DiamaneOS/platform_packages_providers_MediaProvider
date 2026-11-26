@@ -113,6 +113,125 @@ public final class VmDecode {
     private VmDecode() {
     }
 
+    // Per thread: the uptime by which every decode call must end (0: no bound of the caller's own), and how many calls
+    // failed as unavailable.
+    private static final ThreadLocal<long[]> sBound = ThreadLocal.withInitial(() -> new long[1]);
+    private static final ThreadLocal<int[]> sUnavailable = ThreadLocal.withInitial(() -> new int[1]);
+    private static final java.util.List<Runnable> sAnswerListeners =
+            new java.util.concurrent.CopyOnWriteArrayList<>();
+
+    /** Ends a bound set by {@link #boundWaits}. */
+    public static final class Bound implements AutoCloseable {
+        private final long mPrevious;
+        private final CancellationSignal mPreviousSignal;
+
+        Bound(long previous, CancellationSignal previousSignal) {
+            mPrevious = previous;
+            mPreviousSignal = previousSignal;
+        }
+
+        @Override
+        public void close() {
+            sBound.get()[0] = mPrevious;
+            sBoundSignal.set(mPreviousSignal);
+        }
+    }
+
+    /**
+     * Until the returned bound is closed, every decode call on this thread ends within {@code timeoutMs} from now in
+     * all (connecting, queueing and the call itself), failing as unavailable past it. For work an app's binder call
+     * waits for (a scan of a file the app just wrote): it waits for the service no longer than Android's own header
+     * read would take, and what is left out is filled in later.
+     */
+    public static Bound boundWaits(long timeoutMs) {
+        return boundWaits(timeoutMs, null);
+    }
+
+    private static final ThreadLocal<CancellationSignal> sBoundSignal = new ThreadLocal<>();
+
+    static CancellationSignal boundSignal() {
+        return sBoundSignal.get();
+    }
+
+    public static Bound boundWaits(long timeoutMs, CancellationSignal signal) {
+        final CancellationSignal previousSignal = sBoundSignal.get();
+        sBoundSignal.set(signal == null ? previousSignal : signal);
+        final long[] bound = sBound.get();
+        final long previous = bound[0];
+        final long end = SystemClock.uptimeMillis() + Math.max(1, timeoutMs);
+        bound[0] = previous == 0 ? end : Math.min(previous, end);
+        return new Bound(previous, previousSignal);
+    }
+
+    static long boundEnd() {
+        return sBound.get()[0];
+    }
+
+    /** A counter of the decode calls on this thread that failed as unavailable. It only grows. */
+    public static int unavailableCount() {
+        return sUnavailable.get()[0];
+    }
+
+    static void countUnavailable() {
+        sUnavailable.get()[0]++;
+    }
+
+    /**
+     * Adds {@code listener}, run each time the decode service answers a call after calls failed, or connects anew (on
+     * the thread that saw it: post any work elsewhere). For components that live as long as the process.
+     */
+    public static void addAnswerListener(@NonNull Runnable listener) {
+        sAnswerListeners.add(listener);
+    }
+
+    // How often the service answered after failures or connected anew, guarded by sAnswersLock.
+    private static final Object sAnswersLock = new Object();
+    private static int sAnswers;
+
+    /** A mark for {@link #awaitAnswer}, taken before a call: an answer after it ends the wait at once. */
+    public static int answersMark() {
+        synchronized (sAnswersLock) {
+            return sAnswers;
+        }
+    }
+
+    /**
+     * Waits on this background thread until the service answers after {@code mark} (see {@link #addAnswerListener}),
+     * at most {@code timeoutMs}, or until {@code signal} is cancelled. True when it answered.
+     */
+    public static boolean awaitAnswer(int mark, long timeoutMs, @Nullable CancellationSignal signal) {
+        final long end = SystemClock.uptimeMillis() + timeoutMs;
+        synchronized (sAnswersLock) {
+            while (sAnswers == mark) {
+                final long left = end - SystemClock.uptimeMillis();
+                if (left <= 0 || (signal != null && signal.isCanceled())) {
+                    return false;
+                }
+                try {
+                    sAnswersLock.wait(Math.min(left, 250));
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return false;
+                }
+            }
+            return true;
+        }
+    }
+
+    static void serviceAnswers() {
+        synchronized (sAnswersLock) {
+            sAnswers++;
+            sAnswersLock.notifyAll();
+        }
+        for (Runnable listener : sAnswerListeners) {
+            try {
+                listener.run();
+            } catch (RuntimeException e) {
+                Log.w(TAG, "decode service answer listener failed: " + e);
+            }
+        }
+    }
+
     /** Called once from MediaProvider and its activities. Binding happens on first use. */
     public static void init(@NonNull Context context) {
         synchronized (sLock) {
@@ -128,6 +247,13 @@ public final class VmDecode {
                 throw new VmDecodeUnavailableException("VmDecode used before init");
             }
             return sClient;
+        }
+    }
+
+    /** True once {@link #init} ran in this process. */
+    public static boolean isInitialized() {
+        synchronized (sLock) {
+            return sClient != null;
         }
     }
 
@@ -161,47 +287,43 @@ public final class VmDecode {
      */
     public static @NonNull Info probe(@NonNull File file, @Nullable String owner, int priority)
             throws IOException {
-        final String key = identity(file);
-        final Info cached = sProbeCache.get(key);
-        if (cached != null) {
-            return cached;
-        }
-        final Rejected rejected = sRejectedCache.get(key);
-        if (rejected != null) {
-            if (SystemClock.elapsedRealtime() < rejected.until) {
-                throw new VmDecodeRejectedException(rejected.message, true);
+        try (SourceReader.Prepared prepared = SourceReader.prepare(file, owner, true)) {
+            final String key = prepared.identity;
+            final Info cached = sProbeCache.get(key);
+            if (cached != null) return cached;
+            final Rejected rejected = sRejectedCache.get(key);
+            if (rejected != null) {
+                if (SystemClock.elapsedRealtime() < rejected.until) {
+                    throw new VmDecodeRejectedException(rejected.message, true);
+                }
+                sRejectedCache.remove(key);
             }
-            sRejectedCache.remove(key);
-        }
-        try (ParcelFileDescriptor opened = ParcelFileDescriptor.open(file,
-                ParcelFileDescriptor.MODE_READ_ONLY);
-                ParcelFileDescriptor pfd = safeSource(opened, owner, true)) {
-            final DecodeRequest request = request(pfd, owner, priority, mimeOf(file));
-            final Info info = client().call(priority, owner, service -> {
-                final ImageInfo reply = service.probe(request);
-                checkReply(reply == null, DecodeChecks.check(reply));
-                checkStatus(reply.status);
-                return new Info(reply.format, reply.width, reply.height, reply.animated);
-            });
-            sProbeCache.put(key, info);
-            return info;
-        } catch (VmDecodeRejectedException e) {
-            if (e.verdict) {
-                sRejectedCache.put(key, new Rejected(e.getMessage() == null ? "rejected" : e.getMessage(),
-                        SystemClock.elapsedRealtime() + REJECTED_MILLIS));
+            try {
+                final DecodeRequest request = request(prepared.file, owner, priority, mimeOf(file));
+                final Info info = client().call(priority, owner, service -> {
+                    final ImageInfo reply = service.probe(request);
+                    checkReply(reply == null, DecodeChecks.check(reply));
+                    checkStatus(reply.status);
+                    return new Info(reply.format, reply.width, reply.height, reply.animated);
+                });
+                sProbeCache.put(key, info);
+                return info;
+            } catch (VmDecodeRejectedException e) {
+                if (e.verdict) {
+                    sRejectedCache.put(key, new Rejected(e.getMessage() == null ? "rejected" : e.getMessage(),
+                            SystemClock.elapsedRealtime() + REJECTED_MILLIS));
+                }
+                throw e;
             }
-            throw e;
         }
     }
 
     /** A thumbnail of an image file that fits in {@code size}, turned upright. */
     public static @NonNull Bitmap imageThumbnail(@NonNull File file, @NonNull Size size, @Nullable String owner,
             @Nullable CancellationSignal signal) throws IOException {
-        try (ParcelFileDescriptor opened = ParcelFileDescriptor.open(file,
-                ParcelFileDescriptor.MODE_READ_ONLY);
-                ParcelFileDescriptor pfd = safeSource(opened, owner, false)) {
-            return decode(pfd, owner, PRIORITY_USER_WAITING, mimeOf(file), size.getWidth(), size.getHeight(),
-                    signal);
+        try (SourceReader.Prepared prepared = SourceReader.prepare(file, owner, false)) {
+            return decode(prepared.file, owner, PRIORITY_USER_WAITING, mimeOf(file),
+                    size.getWidth(), size.getHeight(), signal);
         }
     }
 
@@ -637,7 +759,7 @@ public final class VmDecode {
         return memoryFile(bytes, bytes.length);
     }
 
-    private static ParcelFileDescriptor memoryFile(byte[] bytes, int length) throws IOException {
+    static ParcelFileDescriptor memoryFile(byte[] bytes, int length) throws IOException {
         FileDescriptor fd = null;
         try {
             fd = Os.memfd_create("vmdecode", OsConstants.MFD_CLOEXEC);
@@ -789,13 +911,18 @@ public final class VmDecode {
         }
     }
 
-    /** Maps a checked reply's status: OK returns, unavailable counts as unavailable, the rest reject the file. */
+    /**
+     * Maps a checked reply's status: OK returns, unavailable and no room count as unavailable (asked again once the
+     * service answers, see addAnswerListener), the rest reject the file.
+     */
     private static void checkStatus(int status) throws RemoteException, VmDecodeRejectedException {
         switch (status) {
             case IDecodeService.STATUS_OK:
                 return;
             case IDecodeService.STATUS_UNAVAILABLE:
                 throw new RemoteException("decode service unavailable");
+            case IDecodeService.STATUS_NO_ROOM:
+                throw new RemoteException("no room in the decode service now");
             case IDecodeService.STATUS_UNSUPPORTED:
                 throw new VmDecodeRejectedException("unsupported format", true);
             case IDecodeService.STATUS_INVALID:
