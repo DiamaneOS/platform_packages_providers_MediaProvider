@@ -21,7 +21,6 @@ import de.diamaneos.sanitizer.decode.AppImagesRequest;
 import de.diamaneos.sanitizer.decode.DecodeRequest;
 import de.diamaneos.sanitizer.decode.Frames;
 import de.diamaneos.sanitizer.decode.ImageInfo;
-import de.diamaneos.sanitizer.decode.MetadataRecord;
 import de.diamaneos.sanitizer.decode.Thumbnail;
 
 /**
@@ -61,7 +60,7 @@ interface IDecodeService {
     const int COLOR_SPACE_DISPLAY_P3 = 1;
 
     /**
-     * Thumbnails and metadata: a longer input is refused (STATUS_INVALID). A regular file the service can read without
+     * Thumbnails: a longer input is refused (STATUS_INVALID). A regular file the service can read without
      * stalling (not on FUSE) longer than MAX_BUFFERED_BYTES is streamed to the VM, never held whole, and is decoded
      * when it is a JPEG or PNG. Any other format above MAX_BUFFERED_BYTES is refused.
      */
@@ -73,15 +72,15 @@ interface IDecodeService {
     const int MAX_DIMENSION = 65535;
     const int MAX_PIXELS = 8388608;
     const int MAX_STRIPE_BYTES = 262144;
-    const int MAX_TEXT_CHARS = 256;
-    const int MAX_NUMBER_CHARS = 32;
-    const int MAX_ID_CHARS = 128;
     const int HANDLE_TIMEOUT_MILLIS = 30000;
 
     /** Frames: at most this many frames, each at most this long, all pixels together at most this many bytes. */
     const int MAX_FRAMES = 1024;
     const int MAX_FRAME_MILLIS = 65535;
     const int MAX_FRAMES_BYTES = 33554432;
+
+    /** decodeRegion: the largest sample size. */
+    const int MAX_REGION_SAMPLE = 64;
 
     /** Thumbnail.gainmapParams: this many values. */
     const int GAINMAP_PARAMS = 17;
@@ -107,9 +106,6 @@ interface IDecodeService {
     /** Frees a thumbnail's or frames' pixels in the service. */
     void release(long handle);
 
-    /** The fixed metadata record for an image. */
-    MetadataRecord readMetadata(in DecodeRequest request);
-
     /**
      * An animation (GIF or WebP), every frame fitting maxWidth x maxHeight with its aspect ratio kept, scaled down
      * further when all frames would exceed MAX_FRAMES_BYTES, and at most MAX_FRAMES of them. STATUS_UNSUPPORTED for
@@ -130,4 +126,13 @@ interface IDecodeService {
      * their transaction numbers.
      */
     AppImageFiles listAppImageFiles(in AppImagesRequest request);
+
+    /**
+     * A region of the stored image, never turned or mirrored (as Android's region decoder reads it): left, top,
+     * width and height in its pixels, decoded at full detail and scaled down by sampleSize (1 to MAX_REGION_SAMPLE) to
+     * at most ceil(width / sampleSize) x ceil(height / sampleSize), which must be at most MAX_PIXELS. A Thumbnail
+     * with rotation 0 and no gain map. STATUS_INVALID for a region outside the image. Last, so callers built before it
+     * keep their transaction numbers.
+     */
+    Thumbnail decodeRegion(in DecodeRequest request, int left, int top, int width, int height, int sampleSize);
 }

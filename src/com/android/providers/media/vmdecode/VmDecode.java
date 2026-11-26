@@ -55,7 +55,6 @@ import de.diamaneos.sanitizer.decode.DecodeRequest;
 import de.diamaneos.sanitizer.decode.Frames;
 import de.diamaneos.sanitizer.decode.IDecodeService;
 import de.diamaneos.sanitizer.decode.ImageInfo;
-import de.diamaneos.sanitizer.decode.MetadataRecord;
 import de.diamaneos.sanitizer.decode.Thumbnail;
 
 import java.io.ByteArrayOutputStream;
@@ -585,67 +584,6 @@ public final class VmDecode {
             out.closeWithError(why);
         } catch (IOException | RuntimeException ignored) {
             // Closed already: the picker gave up.
-        }
-    }
-
-    /** The checked metadata record of an image. */
-    public static @NonNull Metadata readMetadata(@NonNull File file, @Nullable String owner, int priority)
-            throws IOException {
-        try (ParcelFileDescriptor opened = ParcelFileDescriptor.open(file,
-                ParcelFileDescriptor.MODE_READ_ONLY);
-                ParcelFileDescriptor pfd = safeSource(opened, owner, false)) {
-            final DecodeRequest request = request(pfd, owner, priority, mimeOf(file));
-            return client().call(priority, owner, service -> {
-                final MetadataRecord reply = service.readMetadata(request);
-                if (reply != null) {
-                    DecodeChecks.dropFutureDate(reply, System.currentTimeMillis());
-                }
-                checkReply(reply == null, DecodeChecks.check(reply, System.currentTimeMillis()));
-                checkStatus(reply.status);
-                return new Metadata(reply);
-            });
-        }
-    }
-
-    /** {@link MetadataRecord} after every field passed its rule (DecodeChecks). */
-    public static final class Metadata {
-        public final int format;
-        public final int width;
-        public final int height;
-        public final int orientation;
-        public final long dateTakenMillis;
-        public final boolean offsetKnown;
-        public final double latitude;
-        public final double longitude;
-        public final String description;
-        public final String exposureTime;
-        public final String fNumber;
-        public final String iso;
-        public final String sceneCaptureType;
-        public final String documentId;
-        public final String instanceId;
-        public final String originalDocumentId;
-        public final int specialFormat;
-
-        /** Only after DecodeChecks.check passed. */
-        private Metadata(MetadataRecord r) {
-            format = r.format;
-            width = r.width;
-            height = r.height;
-            orientation = r.orientation;
-            dateTakenMillis = r.dateTakenMillis;
-            offsetKnown = r.offsetKnown;
-            latitude = r.latitude;
-            longitude = r.longitude;
-            description = r.description;
-            exposureTime = r.exposureTime;
-            fNumber = r.fNumber;
-            iso = r.iso;
-            sceneCaptureType = r.sceneCaptureType;
-            documentId = r.documentId;
-            instanceId = r.instanceId;
-            originalDocumentId = r.originalDocumentId;
-            specialFormat = r.specialFormat;
         }
     }
 
