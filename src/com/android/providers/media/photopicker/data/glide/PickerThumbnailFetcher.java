@@ -19,19 +19,25 @@ package com.android.providers.media.photopicker.data.glide;
 import android.content.ContentResolver;
 import android.content.Context;
 import android.content.res.AssetFileDescriptor;
+import android.graphics.Bitmap;
 import android.graphics.Point;
 import android.os.Bundle;
 import android.os.CancellationSignal;
 import android.provider.CloudMediaProviderContract;
 import android.provider.MediaStore;
+import android.util.DisplayMetrics;
 import android.util.Log;
 
 import androidx.annotation.Nullable;
+
+import com.android.providers.media.vmdecode.VmDecode;
 
 import com.bumptech.glide.Priority;
 import com.bumptech.glide.load.DataSource;
 import com.bumptech.glide.load.data.DataFetcher;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
@@ -48,17 +54,20 @@ public class PickerThumbnailFetcher implements DataFetcher<InputStream> {
     private final int mWidth;
     private final int mHeight;
     private final boolean mIsThumbRequest;
+    private final boolean mAnimate;
     private final CancellationSignal mCancellationSignal;
     @Nullable private AssetFileDescriptor mAssetFileDescriptor = null;
     @Nullable private InputStream mInputStream = null;
 
     PickerThumbnailFetcher(
-            Context context, GlideLoadable model, int width, int height, boolean isThumbRequest) {
+            Context context, GlideLoadable model, int width, int height, boolean isThumbRequest,
+            boolean animate) {
         mContext = context;
         mModel = model;
         mWidth = width;
         mHeight = height;
         mIsThumbRequest = isThumbRequest;
+        mAnimate = animate;
         mCancellationSignal = new CancellationSignal();
     }
 
@@ -88,7 +97,30 @@ public class PickerThumbnailFetcher implements DataFetcher<InputStream> {
                 callback.onLoadFailed(new FileNotFoundException(err));
                 return;
             }
-            mInputStream = mAssetFileDescriptor.createInputStream();
+            // The bytes may come from another app (a cloud media provider) or from any file. They are
+            // decoded only in the decode service's VM, and Glide gets a PNG made here from the checked
+            // pixels. Unavailable or undecodable fails the load: Glide never sees the original bytes.
+            final DisplayMetrics metrics = mContext.getResources().getDisplayMetrics();
+            final int screen = Math.max(metrics.widthPixels, metrics.heightPixels);
+            final int maxWidth = mWidth > 0 ? mWidth : screen;
+            final int maxHeight = mHeight > 0 ? mHeight : screen;
+            // The descriptor goes to the decode service as it is: a provider that stalls or never ends is
+            // read by the service under its own deadline, never by a thread here.
+            final String owner = VmDecode.pickerOwner(mContext, mModel.getLoadableUri());
+            if (mAnimate) {
+                // A GIF or animated WebP preview: every frame made in the VM, played by VmFrames' drawable.
+                final VmDecode.Animation a = VmDecode.decodeAssetAnimation(mAssetFileDescriptor, owner,
+                        VmDecode.PRIORITY_USER_WAITING, maxWidth, maxHeight, mCancellationSignal);
+                mInputStream = new ByteArrayInputStream(a.encoded);
+                callback.onDataReady(mInputStream);
+                return;
+            }
+            final Bitmap bitmap = VmDecode.decodeAsset(mAssetFileDescriptor, owner,
+                    VmDecode.PRIORITY_USER_WAITING, maxWidth, maxHeight, mCancellationSignal);
+            final ByteArrayOutputStream png = new ByteArrayOutputStream();
+            bitmap.compress(Bitmap.CompressFormat.PNG, 100, png);
+            bitmap.recycle();
+            mInputStream = new ByteArrayInputStream(png.toByteArray());
             callback.onDataReady(mInputStream);
         } catch (IOException e) {
             callback.onLoadFailed(e);

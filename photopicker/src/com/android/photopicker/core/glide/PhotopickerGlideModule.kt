@@ -21,6 +21,7 @@ import android.content.Context
 import android.graphics.drawable.Drawable
 import android.util.Log
 import com.android.photopicker.core.ApplicationOwned
+import com.android.providers.media.vmdecode.frames.VmFrames
 import com.bumptech.glide.Glide
 import com.bumptech.glide.GlideBuilder
 import com.bumptech.glide.Registry
@@ -62,6 +63,9 @@ class PhotopickerGlideModule : AppGlideModule() {
             Drawable::class.java,
             PhotopickerDrawableLoaderFactory(context),
         )
+        // DiamaneOS: an animation MediaProvider made in the decode service's VM (VmFrames), before any decoder that
+        // would read image bytes. It never decodes an image file.
+        registry.prepend(InputStream::class.java, Drawable::class.java, VmFrames.Decoder(context.resources))
     }
 
     override fun applyOptions(context: Context, builder: GlideBuilder) {

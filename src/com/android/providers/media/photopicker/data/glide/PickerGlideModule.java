@@ -35,5 +35,9 @@ public class PickerGlideModule extends AppGlideModule {
     public void registerComponents(Context context, Glide glide, Registry registry) {
         registry.append(
                 GlideLoadable.class, InputStream.class, new PickerModelLoaderFactory(context));
+        // DiamaneOS: an animation made in the decode service's VM (VmFrames), before any decoder that would read
+        // image bytes. It never decodes an image file.
+        registry.prepend(InputStream.class, android.graphics.drawable.Drawable.class,
+                new com.android.providers.media.vmdecode.frames.VmFrames.Decoder(context.getResources()));
     }
 }
