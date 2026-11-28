@@ -1220,12 +1220,16 @@ public class MediaDocumentsProvider extends DocumentsProvider {
         try {
             if (TYPE_IMAGES_BUCKET.equals(ident.type)) {
                 final long id = getImageForBucketCleared(ident.id);
-                return openOrCreateImageThumbnailCleared(id, sizeHint, signal);
+                // DiamaneOS: the bucket's item gone meanwhile leaves the bucket's thumbnail for the next load.
+                return com.android.providers.media.vmdecode.VmThumbnailErrors.laterIfGone(
+                        openOrCreateImageThumbnailCleared(id, sizeHint, signal));
             } else if (TYPE_IMAGE.equals(ident.type)) {
                 return openOrCreateImageThumbnailCleared(ident.id, sizeHint, signal);
             } else if (TYPE_VIDEOS_BUCKET.equals(ident.type)) {
                 final long id = getVideoForBucketCleared(ident.id);
-                return openOrCreateVideoThumbnailCleared(id, sizeHint, signal);
+                // DiamaneOS: as for an images bucket.
+                return com.android.providers.media.vmdecode.VmThumbnailErrors.laterIfGone(
+                        openOrCreateVideoThumbnailCleared(id, sizeHint, signal));
             } else if (TYPE_VIDEO.equals(ident.type)) {
                 return openOrCreateVideoThumbnailCleared(ident.id, sizeHint, signal);
             } else if (TYPE_FILE.equals(ident.type)
