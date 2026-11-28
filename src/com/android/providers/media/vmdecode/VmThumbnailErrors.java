@@ -31,6 +31,17 @@ public final class VmThumbnailErrors {
     public interface Open { ParcelFileDescriptor run() throws FileNotFoundException; }
 
     public static AssetFileDescriptor gone() throws FileNotFoundException { return status(GONE); }
+
+    /**
+     * A collection's thumbnail from its newest item: an item gone between the lookup and the open is a failure of the
+     * moment for the collection, which a next load finds another item for.
+     */
+    public static AssetFileDescriptor laterIfGone(AssetFileDescriptor asset) throws FileNotFoundException {
+        final Bundle extras = asset != null ? asset.getExtras() : null;
+        if (extras == null || extras.getInt(STATUS, 0) != GONE) return asset;
+        try { asset.close(); } catch (IOException ignored) { }
+        return later();
+    }
     public static AssetFileDescriptor later() throws FileNotFoundException { return status(0); }
 
     private static AssetFileDescriptor status(int code) throws FileNotFoundException {
